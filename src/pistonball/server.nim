@@ -94,7 +94,7 @@ type
     nativeFinished: Table[string, JsonNode]
     issuedDecisions: Table[string, IssuedDecision]
     latestDecisions: Table[WebSocket, string]
-    disconnected, acknowledged: HashSet[WebSocket]
+    disconnected, acknowledged, legacySockets: HashSet[WebSocket]
     stopId: string
     stopIssuedAt, acknowledgementDeadline: MonoTime
     nextDecisionId: int
@@ -147,6 +147,7 @@ proc initAppState() =
   appState.latestDecisions = initTable[WebSocket, string]()
   appState.disconnected = initHashSet[WebSocket]()
   appState.acknowledged = initHashSet[WebSocket]()
+  appState.legacySockets = initHashSet[WebSocket]()
   appState.globalViewers = initTable[WebSocket, GlobalViewerState]()
   appState.closedSockets = @[]
   appState.config = defaultGameConfig()
@@ -361,13 +362,19 @@ proc parseRegistration*(
     return
   result.ok = true
   result.kind = node{"kind"}.getStr()
-  if result.kind notin ["prompt", "external", "scripted"]:
-    result.ok = false
-    return
   if not node{"scripted"}.isNil and node{"scripted"}.kind == JString:
     result.scripted = node{"scripted"}.getStr()
   result.policy = node{"policy"}.getStr()
   result.prompt = node{"prompt"}.getStr()
+  if result.kind.len == 0:
+    # Pre-0.1.7 players omit `kind` and do not speak the `decision`/`stop` JSON
+    # websocket protocol; seat them on their declared scripted baseline.
+    result.kind = "scripted"
+    if result.scripted.len == 0 and result.policy.len > 0:
+      result.scripted = result.policy
+  if result.kind notin ["prompt", "external", "scripted"]:
+    result.ok = false
+    return
 
 proc retainNativeEvidence(socket: WebSocket, id: string, evidence: JsonNode,
     first: bool, receivedAt: MonoTime): DecisionAttempt =
@@ -492,7 +499,11 @@ proc stopPlayers(cleanupDeadline: MonoTime): bool =
       appState.stopId = stopId
       appState.stopIssuedAt = getMonoTime()
       appState.acknowledgementDeadline = cleanupDeadline - initDuration(seconds = 1)
-      for socket in appState.playerSlots.keys: targets.add(socket)
+      for socket in appState.playerSlots.keys:
+        if socket notin appState.legacySockets:
+          targets.add(socket)
+  if targets.len == 0:
+    return true
   for socket in targets:
     var frame: JsonNode
     var connected: bool
@@ -970,6 +981,11 @@ proc runGameOwnerLoop(
             var policy = engine.seats[index]
             let firstRegistration = not policy.registered
             if not firstRegistration: continue
+            try:
+              if parseJson(chatText){"kind"}.getStr().len == 0:
+                appState.legacySockets.incl(websocket)
+            except CatchableError:
+              discard
             appState.operatorPrompts[websocket] = registration.prompt
             appState.policyLabels[websocket] = registration.policy
             policy.registered = true
@@ -1223,7 +1239,7 @@ proc runGameOwnerLoop(
         sleep(200)
       break
 
-    runFrameLimiter(lastTick, not replayLoaded and config.fastMode,
+    runFrameLimiter(lastTick, not replayLoaded and config.fastMode and sim.phase == Playing,
       sockets, playerIndices, sim.seatCount())
 
 proc gameOwner(args: ptr GameOwnerArgs) {.thread.} =

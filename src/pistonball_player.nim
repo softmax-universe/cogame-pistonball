@@ -120,9 +120,14 @@ when isMainModule:
   installNativeStopHandlers()
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0: quit("COWORLD_PLAYER_WS_URL is not set", 1)
-  let prompt = getEnv("PLAYER_PROMPT").truncateRunes(MaxPromptRunes)
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
-  let kind = if prompt.strip().len > 0: "prompt" else: "scripted"
+  let llmEnabled = getEnv("COWORLD_LLM_ENABLED").strip().toLowerAscii() in ["1", "true", "yes"] or
+    getEnv("COWORLD_LLM_ENDPOINT").strip().len > 0
+  var rawPrompt = getEnv("PLAYER_PROMPT")
+  if rawPrompt.strip().len == 0 and scripted.len == 0 and llmEnabled:
+    rawPrompt = "Coordinate piston height and vertical velocity to roll the ball steadily leftward without stalling. Return only JSON."
+  let prompt = rawPrompt.truncateRunes(MaxPromptRunes)
+  let kind = if prompt.strip().len > 0 and scripted.len == 0: "prompt" else: "scripted"
   let baseline = if scripted.len > 0: scripted else: "wavebot"
   let policy = getEnv("PLAYER_POLICY_LABEL", if kind == "prompt": "prompt" else: baseline)
     .truncateRunes(MaxPolicyLabelRunes)
