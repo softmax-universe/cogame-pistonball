@@ -1075,7 +1075,8 @@ proc runGameOwnerLoop(
             seatSockets[seat] = sockets[i]
             seatConnected[seat] = true
         var absentSeat = -1
-        for seat in 0 ..< engine.seats.len:
+        let requiredSeats = min(config.minPlayers, engine.seats.len)
+        for seat in 0 ..< requiredSeats:
           if not seatConnected[seat] or not engine.seats[seat].registered:
             absentSeat = seat
             break
