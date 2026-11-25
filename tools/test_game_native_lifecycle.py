@@ -22,11 +22,13 @@ def free_port() -> int:
 async def main() -> None:
     game, player, destination = map(lambda arg: Path(arg).resolve(), sys.argv[1:4])
     scenario = sys.argv[4] if len(sys.argv) == 5 else "complete"
-    assert scenario in ("complete", "large", "TERM", "INT")
+    assert scenario in ("complete", "large", "TERM", "INT", "invalid_action", "no_endpoint")
     destination.mkdir(mode=0o700)
     action = {"mode": "wave", "trigger_m": 0.2, "lead_ticks": 12,
               "up_m": 1.6, "down_m": 0.0, "idle_m": 0.0, "speed": 1.0,
               "blind": "hold", "note": "diagnostic", "say": ""}
+    if scenario == "invalid_action":
+        action = {"mode": "invalid_mode", "trigger_m": 99.0}
     calls = []
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -36,7 +38,7 @@ async def main() -> None:
         assert body["temperature"] == 0.4 if scenario == "large" else "temperature" not in body
         call_id = str(uuid.uuid4())
         entered.set()
-        if scenario not in ("complete", "large"):
+        if scenario in ("TERM", "INT"):
             partial = web.StreamResponse(status=200, headers={"X-Softmax-Llm-Call-Id": call_id})
             await partial.prepare(request)
             await partial.write(b"\xff{")
@@ -79,6 +81,7 @@ async def main() -> None:
                         "COGAME_SAVE_TRAJECTORY_URI": private.as_uri(),
                         "COGAME_RESULTS_URI": (destination / "results.json").as_uri(),
                         "COGAME_SAVE_REPLAY_URI": (destination / "episode.replay").as_uri(),
+                        "COGAME_PLAYER_FAILURE_URI": (destination / "player_failure.json").as_uri(),
                         "COWORLD_EPISODE_ID": "piston-native-diagnostic",
                         "COWORLD_GAME_VERSION": "source-diagnostic",
                         "COWORLD_SOURCE_REVISION": "a" * 40, "COWORLD_TIMEOUT_SECONDS": "75"}
@@ -102,22 +105,31 @@ async def main() -> None:
             for seat in range(20):
                 player_env = os.environ | {"COWORLD_PLAYER_WS_URL":
                     f"ws://127.0.0.1:{game_port}/player?slot={seat}&token=fixture-{seat}",
-                    "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{http_port}",
-                    "PLAYER_PROMPT": "diagnostic operator", "PLAYER_POLICY_LABEL": "fixture-native",
+                    "COWORLD_LLM_ENABLED": "true",
+                    "PLAYER_POLICY_LABEL": "fixture-native",
                     "COWORLD_TIMEOUT_SECONDS": "75"}
+                player_env.pop("PLAYER_PROMPT", None)
+                player_env.pop("PLAYER_SCRIPTED", None)
                 player_env.pop("COWORLD_LLM_TEMPERATURE", None)
+                if scenario == "no_endpoint":
+                    player_env.pop("COWORLD_LLM_ENDPOINT", None)
+                else:
+                    player_env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{http_port}"
+                if scenario in ("complete", "large", "TERM", "INT"):
+                    player_env["PLAYER_PROMPT"] = "diagnostic operator"
                 if scenario == "large":
                     player_env["COWORLD_LLM_TEMPERATURE"] = "0.4"
                 processes.append(await asyncio.create_subprocess_exec(str(player), env=player_env,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE))
-            assert await asyncio.wait_for(entered.wait(), 15)
-            # Joining during the actual HTTP wait must receive the real board.
-            async with session.ws_connect(f"http://127.0.0.1:{game_port}/global") as viewer:
-                frame = await asyncio.wait_for(viewer.receive(), 5)
-                assert frame.type.name == "BINARY" and len(frame.data) > 0
-            if scenario in ("complete", "large"):
+            if scenario != "no_endpoint":
+                assert await asyncio.wait_for(entered.wait(), 15)
+                # Joining during the actual HTTP wait must receive the real board.
+                async with session.ws_connect(f"http://127.0.0.1:{game_port}/global") as viewer:
+                    frame = await asyncio.wait_for(viewer.receive(), 5)
+                    assert frame.type.name == "BINARY" and len(frame.data) > 0
+            if scenario in ("complete", "large", "invalid_action"):
                 release.set()
-            else:
+            elif scenario in ("TERM", "INT"):
                 game_process.send_signal(signal.SIGTERM if scenario == "TERM" else signal.SIGINT)
             async with asyncio.timeout(45):
                 for index, process in enumerate(processes):
@@ -127,10 +139,17 @@ async def main() -> None:
                     assert process.returncode == 0, (index, process.returncode)
         events = [json.loads(line) for line in private.read_text().splitlines()]
         episode = events[-1]
-        expected_status = "completed" if scenario in ("complete", "large") else "truncated"
+        expected_status = (
+            "completed" if scenario in ("complete", "large")
+            else "failed" if scenario in ("invalid_action", "no_endpoint")
+            else "truncated"
+        )
         assert episode["status"] == expected_status and episode["outcome"]["all_player_workers_joined"]
         assert (destination / "results.json").is_file() == (scenario in ("complete", "large"))
         assert (destination / "episode.replay").is_file() == (scenario in ("complete", "large"))
+        if scenario in ("invalid_action", "no_endpoint"):
+            assert (destination / "player_failure.json").is_file()
+            assert episode.get("participants") is None
         known = {call["call_id"]: call for call in calls}
         accepted = 0
         for event in events[:-1]:
@@ -145,7 +164,7 @@ async def main() -> None:
                         assert attempt["response_body_b64"] in (None, "")
                         assert not attempt["accepted"]
                     else:
-                        assert attempt["response_complete"] is (scenario in ("complete", "large"))
+                        assert attempt["response_complete"] is (scenario in ("complete", "large", "invalid_action"))
                         assert attempt["response_body_b64"] == known[attempt["platform_call_id"]]["body_b64"]
             if scenario == "large" and attempt["origin"] == "model" and event["seat"] == "0":
                     assert attempt["prompt_token_ids"] == list(range(32768))

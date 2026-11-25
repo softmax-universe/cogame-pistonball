@@ -101,8 +101,8 @@ async def main() -> None:
         assert observed_starts
         events = [json.loads(line) for line in private.read_text().splitlines()]
         episode = events[-1]
-        assert episode["status"] == "truncated"
-        assert not episode["outcome"]["all_player_workers_joined"]
+        assert episode["status"] == "failed"
+        assert episode.get("participants") is None
         assert not (output / "results.json").exists()
         rejections = episode["outcome"]["rejected_player_frames"]
         assert any("first model start must precede observed response facts" in record["error"]

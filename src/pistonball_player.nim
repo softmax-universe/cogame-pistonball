@@ -52,7 +52,7 @@ proc runDecision(call: PlayerCall, client: LlmClient) {.gcsafe.} =
       withLock evidenceLock: activeControl = nil
     busy.store(false)
   var reply = %*{"type": "action", "decision_id": call.decisionId,
-    "attempt_id": call.attemptId, "source": "fallback",
+    "attempt_id": call.attemptId, "source": "error",
     "training_attempt": newJNull()}
   if client.disabled:
     reply["cause"] = %"no_endpoint"
@@ -122,9 +122,15 @@ when isMainModule:
   if url.len == 0: quit("COWORLD_PLAYER_WS_URL is not set", 1)
   let prompt = getEnv("PLAYER_PROMPT").truncateRunes(MaxPromptRunes)
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
-  let kind = if prompt.strip().len > 0: "prompt" else: "scripted"
+  let llmEnabled = getEnv("COWORLD_LLM_ENABLED").strip().toLowerAscii() == "true"
+  let kind =
+    if scripted.len > 0: "scripted"
+    elif llmEnabled or prompt.strip().len > 0: "prompt"
+    else:
+      raise newException(ValueError,
+        "player requires COWORLD_LLM_ENABLED=true, PLAYER_PROMPT, or PLAYER_SCRIPTED")
   let baseline = if scripted.len > 0: scripted else: "wavebot"
-  let policy = getEnv("PLAYER_POLICY_LABEL", if kind == "prompt": "prompt" else: baseline)
+  let policy = getEnv("PLAYER_POLICY_LABEL", if kind == "prompt": "llm" else: baseline)
     .truncateRunes(MaxPolicyLabelRunes)
   let timeout = getEnv("COWORLD_TIMEOUT_SECONDS", "1200").parseFloat()
   if timeout <= 0 or classify(timeout) in {fcNan, fcInf, fcNegInf}:

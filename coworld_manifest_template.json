@@ -1,7 +1,13 @@
 {
   "$schema": "https://softmax.com/schemas/coworld-manifest.json",
   "episode_timeout_minutes": 20,
-  "tags": ["physics", "cooperative", "local-observation", "swarm", "llm"],
+  "tags": [
+    "physics",
+    "cooperative",
+    "local-observation",
+    "swarm",
+    "llm"
+  ],
   "game": {
     "name": "pistonball",
     "description": "Pistonball: twenty player-controlled pistons and one ball. The pistons stand shoulder to shoulder in a bank across the floor of a long, shallow box; the ball is dropped against the right wall and rolls down whatever slope the bank happens to be making under it. Get it to the left wall. The catch is sight: a piston sees only one metre either side of itself, so for most of the run nobody can see the ball at all - you steer from your last sighting, your two visible neighbours' heights, and a single shared number saying whether the bank as a whole gained ground. A travelling wave is the only thing that works and no seat can see the whole wave. Fully cooperative: every seat scores the same, progress toward the goal wall minus a per-tick penalty, so speed is the only tiebreak. Seat-to-piston assignment is reshuffled every episode, so a policy cannot memorise a position.",
@@ -9,7 +15,9 @@
     "runnable": {
       "type": "game",
       "image": "{{PISTONBALL_IMAGE}}",
-      "run": ["/bin/pistonball"],
+      "run": [
+        "/bin/pistonball"
+      ],
       "source_url": "https://github.com/softmax-universe/cogame-pistonball/tree/main"
     },
     "replay_viewer": {
@@ -18,7 +26,10 @@
     "config_schema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tokens", "players"],
+      "required": [
+        "tokens",
+        "players"
+      ],
       "properties": {
         "tokens": {
           "type": "array",
@@ -201,7 +212,9 @@
       "allOf": [
         {
           "if": {
-            "required": ["promptVariant"],
+            "required": [
+              "promptVariant"
+            ],
             "properties": {
               "promptVariant": {
                 "const": "mixed"
@@ -209,7 +222,9 @@
             }
           },
           "then": {
-            "required": ["promptSeed"]
+            "required": [
+              "promptSeed"
+            ]
           }
         }
       ]
@@ -346,11 +361,21 @@
         },
         "reason": {
           "type": "string",
-          "enum": ["complete", "deadline", "fault"]
+          "enum": [
+            "complete",
+            "deadline",
+            "fault"
+          ]
         },
         "endRule": {
           "type": "string",
-          "enum": ["delivered", "out_of_time", "wall_clock", "sim_fault", "host_error"]
+          "enum": [
+            "delivered",
+            "out_of_time",
+            "wall_clock",
+            "sim_fault",
+            "host_error"
+          ]
         },
         "seed": {
           "type": "integer"
@@ -386,7 +411,7 @@
           "title": "Wire protocol",
           "content": {
             "type": "text",
-            "value": "# Pistonball wire protocol\n\n## The player socket\n\n    GET /player?slot=<N>&token=<T>\n\nA bad slot or token is refused with 403 BEFORE the websocket upgrade.\n\nThe server sends a text `welcome` with the authenticated native player slot.\nThe container registers once through Sprite v1 chat:\n\n    {\"type\":\"register\", \"kind\":\"prompt\"|\"scripted\", \"prompt\":\"<private guidance>\",\n     \"scripted\":\"wavebot\"|\"metronome\"|null, \"policy\":\"<free label>\"}\n\nAdmission closes when play starts. The server freezes the registration before\nseating the player. Operator guidance and full model evidence stay in private\ntrajectories; public replay registrations contain neither.\n\nA text `decision` carries string `decision_id` and `attempt_id`, `seat`, the\nprivate `view`, episode-stable selected system rules, `retry`, and\n`transport={budget_ms,cleanup_budget_ms}`. Transport budgets are separate from\nthe model observation. The ordinary turn budget is 20,000 ms: the first call\nuses at most 12,000 ms and one retry at most 6,000 ms, both clipped to that\nsame turn deadline. Ordinary temperature remains omitted; an explicit\n`COWORLD_LLM_TEMPERATURE` must be finite and between zero and two.\n\nThe native container emits `attempt_started` before opening its owned HTTP\nrequest. Its `training_attempt` has exact prompt/request/decoder fields and\nnull response facts. An `action` echoes the issued identifiers, proposed JSON,\nand the same attempt's actual response bytes, headers, model, call identifier,\nand joined-reader evidence. The engine checks response-to-action equality.\nOrdinary parser repairs still execute, but repaired proposals have fallback\nstatus and cannot supply accepted model targets. Player assertions never\nestablish teacher or platform receipt authority.\n\nAt completion or interruption, the engine sends `stop` with the latest\n`decision_id`, an unpredictable `stop_id`, and remaining `cleanup_budget_ms`.\nEvery admitted owner must cancel and join its HTTP worker, including owners\nwhose sockets disconnected. `stopped` echoes the nonce and identifier,\n`worker_status=\"joined\"`, and all retained `{decision_id,training_attempt}`\nrecords. Older-operation bytes are retained against their original issued\nidentity. The game sends `evidence_received` after validating those facts;\nthe container requires that receipt before closing. A self-initiated stop\nuses a null nonce and earns no engine stop-acknowledgement credit.\n\nThe game freezes private evidence admission before sealing its trajectory.\nUnresolved ownership produces private truncation and withholds public results.\nOne absolute cleanup deadline covers private sealing and subsequent public\nartifact writes. The player sends Sprite v1 Ready (0x85) after binary frames.\n\nEach seat's socket receives one binary Sprite v1 frame per tick, filtered by\nthe SAME window predicate the LLM view uses: the housing and floor, the five\npiston heads i-2 .. i+2, this seat's own head highlighted, and the ball only\nwhile its centre is inside the +/-1.00 m window. Everything else is dark. Board\nlabels carry only PST-nn.\n\n## The per-seat view\n\nOne function builds both the seat's frame filter and the LLM user message.\nNumbers are rounded to 2 decimals, in view coordinates (metres, origin\nbottom-left, y up) and degrees per second.\n\n    {\"turn\": 3, \"of\": 8,\n     \"clock\": {\"tick\": 675, \"of\": 1800, \"left_s\": 46.9},\n     \"you\": {\"alias\": \"PST-08\", \"piston\": 7, \"x_m\": 3.80,\n             \"height_m\": 0.92, \"velocity_m_s\": 0.00,\n             \"stroke_m\": 1.60, \"max_speed_m_s\": 1.92, \"width_m\": 0.40},\n     \"window\": {\"half_width_m\": 1.00, \"covers_pistons\": [5, 6, 7, 8, 9],\n                \"neighbour_heights_m\": {\"5\": 0.10, \"6\": 1.44, \"7\": 0.92,\n                                        \"8\": 0.31, \"9\": 0.00},\n                \"ball\": {\"dx_m\": -0.34, \"height_m\": 1.31, \"vx_m_s\": -2.14,\n                         \"vy_m_s\": 0.22, \"spin_deg_s\": -310.0, \"on_me\": true}},\n     \"sightings_count\": 41,\n     \"sightings\": [{\"tick\": 611, \"dx_m\": 0.98, \"height_m\": 0.55,\n                    \"vx_m_s\": -1.90, \"vy_m_s\": 0.05}],\n     \"shared_reward\": {\"last_turn\": 6.42, \"note\": \"...\"},\n     \"goal\": {\"direction\": \"left\", \"your_distance_to_goal_m\": 2.60,\n              \"note\": \"...\"},\n     \"your_last_script\": {...}}\n\nwindow.ball is null whenever the ball is outside the window, and sightings is\n[] when the seat saw nothing at all last turn - which is the common case.\nHidden with no exception: the ball's absolute position whenever it is outside\nthe window, the cumulative reward, bestX, the score so far, any piston height\noutside i-2 .. i+2, which entrant holds any other piston, any other seat's\nscript or note or say, perm, the seed, and every real player name.\n\n## The reply schema\n\n    {\"note\": \"<=160 runes\",\n     \"mode\": \"wave\"|\"lift\"|\"drop\"|\"hold\"|\"catch\"|\"ripple\",\n     \"trigger_m\": 0.0..1.0,\n     \"lead_ticks\": 0..24,\n     \"up_m\": 0.0..1.6,\n     \"down_m\": 0.0..1.6,\n     \"idle_m\": 0.0..1.6,\n     \"speed\": 0.0..1.0,\n     \"blind\": \"hold\"|\"idle\"|\"ripple\",\n     \"say\": \"<=48 runes\"}\n\nParsing is TOLERANT: markdown fences are stripped, the outermost balanced\n{...} is taken if the model prefixed prose, numeric strings are accepted,\ninteger percentages are divided by 100, centimetres are divided by 100, and\nmode/blind are matched case-insensitively. Every bounded field is REPAIRED\nrather than rejected. Only when no object with at least one usable field can be\nrecovered do the single retry and then the scripted fallback fire. Every\ntruncation lands on a RUNE boundary, never a byte boundary.\n\n## The global socket\n\n    GET /global      spectator snapshot, one binary Sprite v1 frame per tick\n\nThe board is perfect information. The broadcast chrome JSON rides the SAME\nbinary sprite channel as the board, as the label of a reserved never-drawn 1x1\nsprite (id 4090), because that is the only channel that survives a hosted\nreplay.\n\nOther routes: GET /healthz, GET /client/global, GET /client/player,\nGET /client/replay (all three serve real pages and none opens the player\nsocket), GET /replay-data.\n\n## The replay\n\nThe replay is the binary COWLDPST format: magic + format version + game\nname/version header, the RESOLVED config JSON (seed, perm, every geometry and\nphysics constant, the twenty rest heights, the roster with real names), then\nthe record stream - joins, leaves, per-tick input-change records (the command\nbytes), chat records (register / script / fallback / budget_guard / result) and\nONE gameHash per tick.\n\nThe static wasm viewer re-steps the sim from the recorded command bytes and\ncompares gameHash against the recorded hash every tick, so one divergent bit is\ncaught at the tick it happens.\n\ntools/replay_summary.py (Python 3 stdlib only) prints one strict-UTF-8 JSON\nobject describing any .replay file.\n"
+            "value": "# Pistonball wire protocol\n\n## The player socket\n\n    GET /player?slot=<N>&token=<T>\n\nA bad slot or token is refused with 403 BEFORE the websocket upgrade.\n\nThe server sends a text `welcome` with the authenticated native player slot.\nThe container registers once through Sprite v1 chat:\n\n    {\"type\":\"register\", \"kind\":\"prompt\"|\"scripted\", \"prompt\":\"<private guidance>\",\n     \"scripted\":\"wavebot\"|\"metronome\"|null, \"policy\":\"<free label>\"}\n\nAdmission closes when play starts. The server freezes the registration before\nseating the player. Operator guidance and full model evidence stay in private\ntrajectories; public replay registrations contain neither.\n\nA text `decision` carries string `decision_id` and `attempt_id`, `seat`, the\nprivate `view`, episode-stable selected system rules, `retry`, and\n`transport={budget_ms,cleanup_budget_ms}`. Transport budgets are separate from\nthe model observation. The ordinary turn budget is 20,000 ms: the first call\nuses at most 12,000 ms and one retry at most 6,000 ms, both clipped to that\nsame turn deadline. Ordinary temperature remains omitted; an explicit\n`COWORLD_LLM_TEMPERATURE` must be finite and between zero and two.\n\nThe native container emits `attempt_started` before opening its owned HTTP\nrequest. Its `training_attempt` has exact prompt/request/decoder fields and\nnull response facts. An `action` echoes the issued identifiers, proposed JSON,\nand the same attempt's actual response bytes, headers, model, call identifier,\nand joined-reader evidence. The engine checks response-to-action equality and strictly validates all eight\ncontrol fields (`mode`, `trigger_m`, `lead_ticks`, `up_m`, `down_m`, `idle_m`,\n`speed`, `blind`). Invalid or missing model output, timeouts, unavailable\nendpoints, or parse failures retry at most once and otherwise end the episode as\nan explicit policy failure with no substitute action and no new scores. Player\nassertions never establish teacher or platform receipt authority.\n\nAt completion or interruption, the engine sends `stop` with the latest\n`decision_id`, an unpredictable `stop_id`, and remaining `cleanup_budget_ms`.\nEvery admitted owner must cancel and join its HTTP worker, including owners\nwhose sockets disconnected. `stopped` echoes the nonce and identifier,\n`worker_status=\"joined\"`, and all retained `{decision_id,training_attempt}`\nrecords. Older-operation bytes are retained against their original issued\nidentity. The game sends `evidence_received` after validating those facts;\nthe container requires that receipt before closing. A self-initiated stop\nuses a null nonce and earns no engine stop-acknowledgement credit.\n\nThe game freezes private evidence admission before sealing its trajectory.\nUnresolved ownership produces private truncation and withholds public results.\nOne absolute cleanup deadline covers private sealing and subsequent public\nartifact writes. The player sends Sprite v1 Ready (0x85) after binary frames.\n\nEach seat's socket receives one binary Sprite v1 frame per tick, filtered by\nthe SAME window predicate the LLM view uses: the housing and floor, the five\npiston heads i-2 .. i+2, this seat's own head highlighted, and the ball only\nwhile its centre is inside the +/-1.00 m window. Everything else is dark. Board\nlabels carry only PST-nn.\n\n## The per-seat view\n\nOne function builds both the seat's frame filter and the LLM user message.\nNumbers are rounded to 2 decimals, in view coordinates (metres, origin\nbottom-left, y up) and degrees per second.\n\n    {\"turn\": 3, \"of\": 8,\n     \"clock\": {\"tick\": 675, \"of\": 1800, \"left_s\": 46.9},\n     \"you\": {\"alias\": \"PST-08\", \"piston\": 7, \"x_m\": 3.80,\n             \"height_m\": 0.92, \"velocity_m_s\": 0.00,\n             \"stroke_m\": 1.60, \"max_speed_m_s\": 1.92, \"width_m\": 0.40},\n     \"window\": {\"half_width_m\": 1.00, \"covers_pistons\": [5, 6, 7, 8, 9],\n                \"neighbour_heights_m\": {\"5\": 0.10, \"6\": 1.44, \"7\": 0.92,\n                                        \"8\": 0.31, \"9\": 0.00},\n                \"ball\": {\"dx_m\": -0.34, \"height_m\": 1.31, \"vx_m_s\": -2.14,\n                         \"vy_m_s\": 0.22, \"spin_deg_s\": -310.0, \"on_me\": true}},\n     \"sightings_count\": 41,\n     \"sightings\": [{\"tick\": 611, \"dx_m\": 0.98, \"height_m\": 0.55,\n                    \"vx_m_s\": -1.90, \"vy_m_s\": 0.05}],\n     \"shared_reward\": {\"last_turn\": 6.42, \"note\": \"...\"},\n     \"goal\": {\"direction\": \"left\", \"your_distance_to_goal_m\": 2.60,\n              \"note\": \"...\"},\n     \"your_last_script\": {...}}\n\nwindow.ball is null whenever the ball is outside the window, and sightings is\n[] when the seat saw nothing at all last turn - which is the common case.\nHidden with no exception: the ball's absolute position whenever it is outside\nthe window, the cumulative reward, bestX, the score so far, any piston height\noutside i-2 .. i+2, which entrant holds any other piston, any other seat's\nscript or note or say, perm, the seed, and every real player name.\n\n## The reply schema\n\n    {\"note\": \"<=160 runes\",\n     \"mode\": \"wave\"|\"lift\"|\"drop\"|\"hold\"|\"catch\"|\"ripple\",\n     \"trigger_m\": 0.0..1.0,\n     \"lead_ticks\": 0..24,\n     \"up_m\": 0.0..1.6,\n     \"down_m\": 0.0..1.6,\n     \"idle_m\": 0.0..1.6,\n     \"speed\": 0.0..1.0,\n     \"blind\": \"hold\"|\"idle\"|\"ripple\",\n     \"say\": \"<=48 runes\"}\n\nParsing is STRICT: optional markdown fences around the single JSON object are\nstripped, and all eight control fields (`mode`, `trigger_m`, `lead_ticks`,\n`up_m`, `down_m`, `idle_m`, `speed`, `blind`) must be present with exact types\nand legal ranges (no unit conversions, clamping, or defaulted fallbacks). `note`\nand `say` are optional spectator strings truncated on RUNE boundaries for\ndisplay/replay. Any invalid or missing model reply triggers at most one retry\nand then terminates the episode as an explicit policy failure with no substitute\nmove and no new scores.\n\n## The global socket\n\n    GET /global      spectator snapshot, one binary Sprite v1 frame per tick\n\nThe board is perfect information. The broadcast chrome JSON rides the SAME\nbinary sprite channel as the board, as the label of a reserved never-drawn 1x1\nsprite (id 4090), because that is the only channel that survives a hosted\nreplay.\n\nOther routes: GET /healthz, GET /client/global, GET /client/player,\nGET /client/replay (all three serve real pages and none opens the player\nsocket), GET /replay-data.\n\n## The replay\n\nThe replay is the binary COWLDPST format: magic + format version + game\nname/version header, the RESOLVED config JSON (seed, perm, every geometry and\nphysics constant, the twenty rest heights, the roster with real names), then\nthe record stream - joins, leaves, per-tick input-change records (the command\nbytes), chat records (register / script / fallback / budget_guard / result) and\nONE gameHash per tick.\n\nThe static wasm viewer re-steps the sim from the recorded command bytes and\ncompares gameHash against the recorded hash every tick, so one divergent bit is\ncaught at the tick it happens.\n\ntools/replay_summary.py (Python 3 stdlib only) prints one strict-UTF-8 JSON\nobject describing any .replay file.\n"
           }
         },
         {
@@ -402,12 +427,39 @@
   },
   "player": [
     {
+      "id": "llm",
+      "type": "player",
+      "name": "Pistonball LLM Player",
+      "description": "Native LLM-controlled piston policy.",
+      "image": "{{PISTONBALL_IMAGE}}",
+      "run": [
+        "/bin/pistonball-player"
+      ],
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+        "PLAYER_POLICY_LABEL": "llm"
+      },
+      "source_url": "https://github.com/softmax-universe/cogame-pistonball/tree/main",
+      "resources": {
+        "requests": {
+          "cpu": "100m",
+          "memory": "64Mi"
+        },
+        "limits": {
+          "cpu": "1"
+        }
+      }
+    },
+    {
       "id": "baseline",
       "type": "player",
       "name": "Pistonball Wavebot Baseline",
       "description": "Reactive scripted piston: lift behind the ball, clear in front. No LLM.",
       "image": "{{PISTONBALL_IMAGE}}",
-      "run": ["/bin/pistonball-player"],
+      "run": [
+        "/bin/pistonball-player"
+      ],
       "env": {
         "PLAYER_SCRIPTED": "wavebot",
         "PLAYER_POLICY_LABEL": "wavebot"
@@ -429,7 +481,9 @@
       "name": "Pistonball Metronome Filler",
       "description": "Blind two-second ripple: never looks at the ball. No LLM.",
       "image": "{{PISTONBALL_IMAGE}}",
-      "run": ["/bin/pistonball-player"],
+      "run": [
+        "/bin/pistonball-player"
+      ],
       "env": {
         "PLAYER_SCRIPTED": "metronome",
         "PLAYER_POLICY_LABEL": "metronome"
@@ -737,10 +791,10 @@
   "certification": {
     "players": [
       {
-        "player_id": "baseline"
+        "player_id": "llm"
       },
       {
-        "player_id": "metronome"
+        "player_id": "baseline"
       },
       {
         "player_id": "metronome"

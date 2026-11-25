@@ -13,15 +13,12 @@
 ## That, not the model, is why there are eight turns and why a turn is 9.375 s
 ## of sim time.
 ##
-## DEGRADE, NEVER HANG. Every wait here is bounded: attempt 1 gets
-## `attempt1Ms`, the single retry gets `retryMs`, the inter-batch floor is a
-## bounded sleep, and the whole turn is wrapped in a monotonic `turnBudgetMs`
-## deadline. A provider throttle with no other candidate model skips the retry
-## outright (it cannot land) and fails fast to the scripted layer. On a second
-## failure the seat plays the `wavebot` script for that turn and a `fallback`
-## record names the cause. No failure mode leaves a piston uncommanded: the
-## controller always has a script — this turn's, else last turn's, else
-## `wavebot`'s.
+## Every wait here is bounded: attempt 1 gets `attempt1Ms`, the single retry
+## gets `retryMs`, the inter-batch floor is a bounded sleep, and the whole turn
+## is wrapped in a monotonic `turnBudgetMs` deadline. A provider throttle or
+## missing endpoint skips the retry outright. If any LLM seat fails to produce
+## a valid model action, the turn records the failure and the server terminates
+## the episode as a policy failure with no substitute action and no new scores.
 
 import
   std/[json, math, monotimes, options, os, times],
@@ -80,6 +77,10 @@ type
     phaseAttempts*: seq[seq[DecisionAttempt]]
     phaseSelected*: seq[Option[string]]
     phaseInstalled*: seq[bool]
+    policyFailed*: bool
+    failedSeat*: int
+    failureCause*: string
+    failureDetail*: string
 
 const
   MaxSightings* = 4
@@ -96,6 +97,7 @@ proc initDecisionEngine*(sim: SimServer): DecisionEngine =
   result.sightingCounts = newSeq[int](seats)
   result.params = DefaultBaselineParams
   result.phaseInstalled = newSeq[bool](seats)
+  result.failedSeat = -1
   for i in 0 ..< seats:
     result.seats[i].baseline = blWavebot
     result.seats[i].label = "wavebot"
@@ -364,11 +366,22 @@ proc turn*(
   engine.phaseAttempts = newSeq[seq[DecisionAttempt]](engine.seats.len)
   engine.phaseSelected = newSeq[Option[string]](engine.seats.len)
   engine.phaseInstalled = newSeq[bool](engine.seats.len)
+  engine.policyFailed = false
+  engine.failedSeat = -1
+  engine.failureCause = ""
+  engine.failureDetail = ""
   for seat in 0 ..< engine.seats.len:
     engine.phaseViews[seat] = engine.windowView(sim, seat, turnIndex)
   let budget = initDuration(milliseconds = max(1, sim.config.turnBudgetMs))
 
-  # --- budget guard: settle EARLY rather than overrun -----------------------
+  template recordPolicyFailure(seat: int, cause, detail: string) =
+    if not engine.policyFailed:
+      engine.policyFailed = true
+      engine.failedSeat = seat
+      engine.failureCause = cause
+      engine.failureDetail = detail
+
+  # --- budget guard: fail cleanly rather than overrun or substitute ---------
   if not engine.llmOff:
     let turnSeconds =
       (sim.config.turnBudgetMs + sim.config.minBatchSpacingMs + 999) div 1000
@@ -377,8 +390,7 @@ proc turn*(
       result.add(budgetGuardRecord(
         turnIndex,
         max(0, sim.config.wallClockBudgetSeconds - elapsedSeconds)))
-      echo "pistonball: budget guard fired at turn ", turnIndex,
-        "; remaining turns play scripted"
+      echo "pistonball: budget guard fired at turn ", turnIndex
 
   # --- which seats need a call? --------------------------------------------
   var open: seq[int]
@@ -387,18 +399,17 @@ proc turn*(
         not engine.seats[seat].unavailable:
       open.add(seat)
     elif engine.seats[seat].isLlm:
-      # An LLM seat that CANNOT call the LLM this turn is a FALLBACK, not a
-      # scripted policy, and the design's `fallback.cause` enum names both
-      # reasons it happens. Recording it is what makes the two countable.
-      engine.installScripted(sim, seat, blWavebot, srcFallback, turnIndex)
       let cause = if engine.llmOff: "budget_guard" else: "no_credentials"
-      result.add(fallbackRecord(turnIndex, seat, 1, cause,
-        "the LLM is unavailable for this turn; playing wavebot"))
-      echo "pistonball llm: seat ", seat, " falling back to wavebot (", cause,
-        ") on turn ", turnIndex
+      let detail = "the LLM is unavailable for this turn"
+      recordPolicyFailure(seat, cause, detail)
+      echo "pistonball llm: seat ", seat, " failed (", cause,
+        ") on turn ", turnIndex, "; ending episode without fallback"
     else:
       engine.installScripted(sim, seat, engine.seats[seat].baseline,
         srcScripted, turnIndex)
+
+  if engine.policyFailed:
+    return
 
   # --- the rate floor ------------------------------------------------------
   # Twenty requests per batch against a 30-per-minute-per-episode cap: hold
@@ -419,23 +430,19 @@ proc turn*(
     engine.batchStarted = true
 
   # `turnBudgetMs` bounds THIS TURN'S OWN WORK — the two attempts — and is
-  # therefore sampled AFTER the rate-floor sleep. Sampling it before would
-  # charge the wait to the budget, and since `minBatchSpacingMs` (45 000) is
-  # larger than `turnBudgetMs` (20 000) every turn after the first would find
-  # the budget already spent and fall back without issuing a request. The
-  # budget guard above already reads the turn as spacing + budget.
+  # therefore sampled AFTER the rate-floor sleep.
   let turnStart = getMonoTime()
 
   # --- up to two PARALLEL batches ------------------------------------------
   var attempt = 0
   var lastCause = newSeq[string](engine.seats.len)
+  var lastDetail = newSeq[string](engine.seats.len)
   var failFast: seq[int]
   while open.len > 0 and attempt < 2:
     if getMonoTime() - turnStart >= budget:
       for seat in open:
-        result.add(fallbackRecord(
-          turnIndex, seat, attempt + 1, "timeout",
-          "per-turn budget exhausted before attempt " & $(attempt + 1)))
+        lastCause[seat] = "timeout"
+        lastDetail[seat] = "per-turn budget exhausted before attempt " & $(attempt + 1)
       break
     let deadlineMs =
       if attempt == 0: sim.config.attempt1Ms else: sim.config.retryMs
@@ -447,6 +454,8 @@ proc turn*(
     let deadline = min(turnStart + budget,
       started + initDuration(milliseconds = max(1, deadlineMs)))
     let replies = engine.batch(calls, deadline)
+    when not defined(emscripten):
+      if interruptionRequested(): return
     let latency = (getMonoTime() - started).inMilliseconds.int
     var stillOpen: seq[int]
     for position, seat in open:
@@ -465,56 +474,59 @@ proc turn*(
           var evidence = retained.get()
           evidence.parsedAction = proposal
           retained = some(evidence)
-        var script = parsePistonScript(
-          proposal,
-          engine.scripts[seat],
-          engine.haveScript[seat])
-        script.source = if reply.origin == aoModel and
-          proposal == appliedScriptAction(script): srcLlm else: srcFallback
+        var script = parsePistonScript(proposal)
+        if reply.origin != aoModel:
+          cause = "invalid_origin"
+          raise newException(ValueError, "proposal lacks native model authority")
+        script.source = srcLlm
+        script.latencyMs = latency
         if retained.isSome:
           var evidence = retained.get()
-          evidence.accepted = script.source == srcLlm
-          if evidence.accepted: engine.phaseSelected[seat] = some(evidence.attemptId)
-          else: evidence.rejectionReason = some("proposal was repaired or lacks native authority")
+          evidence.parsedAction = appliedScriptAction(script)
+          evidence.accepted = true
+          engine.phaseSelected[seat] = some(evidence.attemptId)
           retained = some(evidence)
-        script.latencyMs = latency
         engine.scripts[seat] = script
         engine.haveScript[seat] = true
         engine.phaseInstalled[seat] = true
       except CatchableError as error:
-        result.add(fallbackRecord(turnIndex, seat, attempt + 1, cause,
-          error.msg))
+        if retained.isSome:
+          var evidence = retained.get()
+          evidence.accepted = false
+          if evidence.rejectionReason.isNone:
+            evidence.rejectionReason = some(error.msg)
+          retained = some(evidence)
         lastCause[seat] = cause
-        if cause == "no_credentials":
+        lastDetail[seat] = error.msg
+        if cause in ["no_credentials", "no_endpoint"]:
           engine.seats[seat].unavailable = true
         echo "pistonball llm: seat ", seat, " attempt ", attempt + 1,
-          " failed, falling back if it fails again: ", error.msg
+          " failed (", cause, "): ", error.msg
         stillOpen.add(seat)
       if retained.isSome: engine.phaseAttempts[seat].add(retained.get())
     open = stillOpen
     inc attempt
     var retryable: seq[int]
     for seat in open:
-      if lastCause[seat] in ["throttled", "no_credentials"]:
+      if lastCause[seat] in ["throttled", "no_credentials", "no_endpoint"]:
         failFast.add(seat)
       else:
         retryable.add(seat)
     open = retryable
 
-  # --- anything still open plays wavebot for this turn ---------------------
+  # --- any seat still open ends the episode as a policy failure ------------
   open.add(failFast)
   for seat in open:
-    engine.installScripted(sim, seat, blWavebot, srcFallback, turnIndex)
     let cause =
       if lastCause[seat].len > 0: lastCause[seat]
       elif engine.llmOff: "budget_guard"
       else: "timeout"
-    if cause != "no_credentials":
-      result.add(fallbackRecord(turnIndex, seat, 2, cause,
-        "seat fell back to the wavebot script"))
-    ## "falling back" is the phrase phase 60 greps the GAME log for.
-    echo "pistonball llm: seat ", seat, " falling back to wavebot (", cause,
-      ") on turn ", turnIndex
+    let detail =
+      if lastDetail[seat].len > 0: lastDetail[seat]
+      else: "seat failed to produce a valid model action"
+    recordPolicyFailure(seat, cause, detail)
+    echo "pistonball llm: seat ", seat, " failed (", cause,
+      ") on turn ", turnIndex, "; ending episode without fallback"
 
 proc closeTurn*(engine: var DecisionEngine) =
   ## Clears every seat's sighting buffer once this turn's views have been

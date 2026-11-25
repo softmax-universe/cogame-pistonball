@@ -361,7 +361,7 @@ proc parseRegistration*(
     return
   result.ok = true
   result.kind = node{"kind"}.getStr()
-  if result.kind notin ["prompt", "external", "scripted"]:
+  if result.kind notin ["prompt", "scripted"]:
     result.ok = false
     return
   if not node{"scripted"}.isNil and node{"scripted"}.kind == JString:
@@ -454,7 +454,7 @@ proc parsePlayerFrame(socket: WebSocket, frame: ReceivedPlayerFrame): PlayerFram
       result.reply.ok = true
       result.reply.action = $payload["action"]
     else:
-      result.reply.error = "player returned a fallback"
+      result.reply.error = "player returned no valid action"
       result.reply.cause = payload["cause"].getStr()
     result.kind = pfAction
   except CatchableError as error:
@@ -874,6 +874,8 @@ proc runGameOwnerLoop(
     episodeStart = getMonoTime()
     lastTick = getMonoTime()
     noShowDeclared = false
+    policyFailed = false
+    policyFailureDetails = newJNull()
     quitAfterFrame = false
     liveSpeedIndex = 0
     framesPlayed = 0
@@ -973,7 +975,7 @@ proc runGameOwnerLoop(
             appState.operatorPrompts[websocket] = registration.prompt
             appState.policyLabels[websocket] = registration.policy
             policy.registered = true
-            policy.isLlm = registration.kind in ["prompt", "external"]
+            policy.isLlm = registration.kind == "prompt"
             policy.baseline = parseBaseline(registration.scripted)
             policy.label =
               if registration.policy.len > 0: registration.policy
@@ -1014,16 +1016,17 @@ proc runGameOwnerLoop(
           appState.globalViewers[websocket].replaySeekTick = -1
 
     if not replayLoaded and not noShowDeclared and sim.lobbyJoinTimedOut():
-      # A seat that never connects does NOT end the episode. Report the
-      # no-show to the platform (lowest missing slot only); the sim's own
-      # lobby budget starts the match anyway and that piston plays `wavebot`.
+      # A seat that never connects ends the episode as a player failure rather
+      # than substituting a scripted baseline.
       noShowDeclared = true
       let stuckSlot = sim.nextPlayerSlot()
-      declarePlayerFailure(stuckSlot,
-        "player slot " & $stuckSlot & " never joined the lobby within " &
+      let msg = "player slot " & $stuckSlot & " never joined the lobby within " &
         $config.lobbyJoinTimeoutTicks & " lobby ticks (~" &
-        $(config.lobbyJoinTimeoutTicks div TargetFps) &
-        "s); its piston plays the wavebot baseline", episodeDeadline)
+        $(config.lobbyJoinTimeoutTicks div TargetFps) & "s)"
+      declarePlayerFailure(stuckSlot, msg, episodeDeadline)
+      policyFailed = true
+      policyFailureDetails = %*{"type": "LobbyJoinTimeout", "seat": stuckSlot, "message": msg}
+      quitAfterFrame = true
 
     var frameEvents = newJArray()
     if replayLoaded:
@@ -1077,6 +1080,18 @@ proc runGameOwnerLoop(
                 seat: seat, turn: turnIndex, startTick: sim.tickCount,
                 observation: engine.phaseViews[seat], action: action, status: status,
                 attempts: engine.phaseAttempts[seat], selected: engine.phaseSelected[seat]))
+          if engine.policyFailed and not interruptionRequested():
+            policyFailed = true
+            let msg = "seat " & $engine.failedSeat & " failed (" &
+              engine.failureCause & "): " & engine.failureDetail
+            declarePlayerFailure(engine.failedSeat, msg, episodeDeadline)
+            policyFailureDetails = %*{
+              "type": "PolicyFailure",
+              "seat": engine.failedSeat,
+              "cause": engine.failureCause,
+              "message": engine.failureDetail
+            }
+            quitAfterFrame = true
           if interruptionRequested(): quitAfterFrame = true
           for record in records:
             replayWriter.writeChat(tickTime(sim.tickCount), 0, record)
@@ -1192,11 +1207,11 @@ proc runGameOwnerLoop(
       var protocolFailed: bool
       {.gcsafe.}:
         withLock appState.lock: protocolFailed = appState.protocolFailure
-      let status = if protocolFailed or sim.endReason == ReasonFault: esFailed
+      let status = if protocolFailed or policyFailed or sim.endReason == ReasonFault: esFailed
         elif interruptionRequested() or not allJoined or sim.phase != GameOver: esTruncated
         else: esCompleted
       if status != esCompleted: requestNativeStop()
-      sealPrivate(status, allJoined, cleanupDeadline, newJNull())
+      sealPrivate(status, allJoined, cleanupDeadline, policyFailureDetails)
       {.gcsafe.}:
         withLock appState.lock: appState.finished = true
       if status == esCompleted:

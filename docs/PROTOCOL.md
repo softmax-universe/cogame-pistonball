@@ -28,10 +28,12 @@ The native container emits `attempt_started` before opening its owned HTTP
 request. Its `training_attempt` has exact prompt/request/decoder fields and
 null response facts. An `action` echoes the issued identifiers, proposed JSON,
 and the same attempt's actual response bytes, headers, model, call identifier,
-and joined-reader evidence. The engine checks response-to-action equality.
-Ordinary parser repairs still execute, but repaired proposals have fallback
-status and cannot supply accepted model targets. Player assertions never
-establish teacher or platform receipt authority.
+and joined-reader evidence. The engine checks response-to-action equality and strictly validates all eight
+control fields (`mode`, `trigger_m`, `lead_ticks`, `up_m`, `down_m`, `idle_m`,
+`speed`, `blind`). Invalid or missing model output, timeouts, unavailable
+endpoints, or parse failures retry at most once and otherwise end the episode as
+an explicit policy failure with no substitute action and no new scores. Player
+assertions never establish teacher or platform receipt authority.
 
 At completion or interruption, the engine sends `stop` with the latest
 `decision_id`, an unpredictable `stop_id`, and remaining `cleanup_budget_ms`.
@@ -98,13 +100,14 @@ script or note or say, perm, the seed, and every real player name.
      "blind": "hold"|"idle"|"ripple",
      "say": "<=48 runes"}
 
-Parsing is TOLERANT: markdown fences are stripped, the outermost balanced
-{...} is taken if the model prefixed prose, numeric strings are accepted,
-integer percentages are divided by 100, centimetres are divided by 100, and
-mode/blind are matched case-insensitively. Every bounded field is REPAIRED
-rather than rejected. Only when no object with at least one usable field can be
-recovered do the single retry and then the scripted fallback fire. Every
-truncation lands on a RUNE boundary, never a byte boundary.
+Parsing is STRICT: optional markdown fences around the single JSON object are
+stripped, and all eight control fields (`mode`, `trigger_m`, `lead_ticks`,
+`up_m`, `down_m`, `idle_m`, `speed`, `blind`) must be present with exact types
+and legal ranges (no unit conversions, clamping, or defaulted fallbacks). `note`
+and `say` are optional spectator strings truncated on RUNE boundaries for
+display/replay. Any invalid or missing model reply triggers at most one retry
+and then terminates the episode as an explicit policy failure with no substitute
+move and no new scores.
 
 ## The global socket
 

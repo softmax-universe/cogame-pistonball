@@ -1,6 +1,5 @@
-## The piston-program schema: what a policy (LLM or scripted) may say, how a
-## reply is parsed TOLERANTLY, and how an illegal reply is REPAIRED rather
-## than rejected.
+## The piston-program schema: what a policy (LLM or scripted) may say, strict
+## parsing/validation of model replies, and RUNE-safe display sanitization.
 ##
 ## Both policy kinds emit the SAME object, so the two are strictly comparable
 ## and one validator covers both — that is what makes the bounded-orders test
@@ -119,172 +118,110 @@ proc defaultScript*(): PistonScript =
     latencyMs: 0
   )
 
-proc parseMode*(text: string, fallback: Mode): Mode =
-  ## Tolerant: case-insensitive, surrounding whitespace and hyphens
-  ## normalised. Anything still unknown keeps the caller's fallback.
-  let key = text.strip().toLowerAscii().replace("-", "_").replace(" ", "")
+proc parseMode*(text: string): Mode =
+  ## Strict enum match for `mode`.
   for value in Mode:
-    if $value == key:
+    if $value == text:
       return value
-  fallback
+  raise newException(ScriptError, "invalid mode: " & text)
 
-proc parseBlind*(text: string, fallback: Blind): Blind =
-  let key = text.strip().toLowerAscii().replace("-", "_").replace(" ", "")
+proc parseBlind*(text: string): Blind =
+  ## Strict enum match for `blind`.
   for value in Blind:
-    if $value == key:
+    if $value == text:
       return value
-  fallback
+  raise newException(ScriptError, "invalid blind: " & text)
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## The outermost balanced `{...}` in a model reply, tolerating markdown
-  ## fences and any prose the model prefixed or suffixed. Falls back to
-  ## first-brace..last-brace when the scan finds no balanced pair, which is
-  ## what recovers a reply whose braces sit inside a quoted string.
-  var
-    depth = 0
-    start = -1
-    inString = false
-    escaped = false
-  for i, ch in text:
-    if inString:
-      if escaped: escaped = false
-      elif ch == '\\': escaped = true
-      elif ch == '"': inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{':
-      if depth == 0: start = i
-      inc depth
-    of '}':
-      if depth > 0:
-        dec depth
-        if depth == 0 and start >= 0:
-          try:
-            return parseJson(text[start .. i])
-          except CatchableError:
-            start = -1
-    else: discard
-  let
-    first = text.find('{')
-    last = text.rfind('}')
-  if first < 0 or last <= first:
-    var head = text.strip()
+  ## Extracts a single JSON object from a model reply, tolerating a markdown
+  ## fence around the JSON object while rejecting missing or malformed JSON.
+  var trimmed = strutils.strip(text)
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl >= 0:
+      trimmed = trimmed[firstNl + 1 .. ^1]
+      if trimmed.endsWith("```"):
+        trimmed = trimmed[0 ..< trimmed.len - 3]
+      trimmed = strutils.strip(trimmed)
+  if trimmed.len == 0 or trimmed[0] != '{' or trimmed[^1] != '}':
+    var head = strutils.strip(text)
     if head.runeLen > 160:
       head = head.truncateRunes(160) & "..."
     raise newException(
-      ScriptError, "no JSON object in reply: " & head.replace("\n", " "))
-  parseJson(text[first .. last])
+      ScriptError, "reply is not a single JSON object: " & head.replace("\n", " "))
+  try:
+    result = parseJson(trimmed)
+  except CatchableError as error:
+    raise newException(ScriptError, "malformed JSON object: " & error.msg)
+  if result.kind != JObject:
+    raise newException(ScriptError, "reply is not a JSON object")
 
-proc readNumber(node: JsonNode): tuple[ok: bool, value: float] =
-  ## One numeric field: an int, a finite float, or a numeric string. Anything
-  ## non-finite or unparseable reports `ok = false` so the caller applies the
-  ## schema's documented default rather than inventing a value.
-  if node.isNil:
-    return (false, 0.0)
+proc requireFiniteNumber(payload: JsonNode, key: string): float =
+  if not payload.hasKey(key):
+    raise newException(ScriptError, "missing required field: " & key)
+  let node = payload[key]
   case node.kind
   of JInt:
-    (true, float(node.getBiggestInt()))
+    result = float(node.getBiggestInt())
   of JFloat:
-    let value = node.getFloat()
-    if value != value or value > 1.0e9 or value < -1.0e9: (false, 0.0)
-    else: (true, value)
-  of JString:
-    try:
-      let text = node.getStr().strip().strip(chars = {'%', 'm', ' '})
-      (true, parseFloat(text))
-    except CatchableError:
-      (false, 0.0)
-  of JBool:
-    (true, if node.getBool(): 1.0 else: 0.0)
+    result = node.getFloat()
+    if classify(result) in {fcNan, fcInf, fcNegInf}:
+      raise newException(ScriptError, "non-finite number for field: " & key)
   else:
-    (false, 0.0)
+    raise newException(ScriptError, "field must be a number: " & key)
 
-proc readMetres(node: JsonNode, fallbackUm: int32, maxUm: int32): int32 =
-  ## A `_m` field in metres, quantised to micrometres and clamped.
-  ## CENTIMETRES are accepted too: a value above 10 for a field whose legal
-  ## range tops out at 1.6 is a model that answered in cm, and dividing by
-  ## 100 recovers the intent instead of clamping it to the ceiling.
-  let read = readNumber(node)
-  if not read.ok:
-    return fallbackUm
-  var metres = read.value
-  if metres > 10.0:
-    metres = metres / 100.0
-  var micro = int64(round(metres * 1_000_000.0))
-  if micro < 0: micro = 0
-  if micro > int64(maxUm): micro = int64(maxUm)
-  int32(micro)
+proc requireMetres(payload: JsonNode, key: string, maxUm: int32): int32 =
+  let metres = requireFiniteNumber(payload, key)
+  let maxMetres = float(maxUm) / 1_000_000.0
+  if metres < 0.0 or metres > maxMetres:
+    raise newException(ScriptError, "field out of range [0, " & $maxMetres & "]: " & key)
+  int32(round(metres * 1_000_000.0))
 
-proc readUnit(node: JsonNode, fallback255: int): int =
-  ## A 0..1 fraction, quantised to 0..255. Integer PERCENTAGES are accepted:
-  ## a value above 1 for a 0..1 field is a model that answered in percent.
-  let read = readNumber(node)
-  if not read.ok:
-    return fallback255
-  var unit = read.value
-  if unit > 1.0:
-    unit = unit / 100.0
-  if unit < 0.0: unit = 0.0
-  if unit > 1.0: unit = 1.0
-  var scaled = int(round(unit * 255.0))
-  if scaled < 0: scaled = 0
-  if scaled > 255: scaled = 255
-  scaled
+proc requireUnit(payload: JsonNode, key: string): int =
+  let unit = requireFiniteNumber(payload, key)
+  if unit < 0.0 or unit > 1.0:
+    raise newException(ScriptError, "field out of range [0, 1]: " & key)
+  int(round(unit * 255.0))
 
-proc readTrigger(node: JsonNode, fallbackUm: int32): int32 =
-  ## `trigger_m` is a 0..1 metre distance: percentages are accepted the same
-  ## way the unit fields are, and the result is clamped into the window.
-  let read = readNumber(node)
-  if not read.ok:
-    return fallbackUm
-  var metres = read.value
-  if metres > 10.0:
-    metres = metres / 100.0
-  var micro = int64(round(metres * 1_000_000.0))
-  if micro < 0: micro = 0
-  if micro > int64(WindowHalfWidth): micro = int64(WindowHalfWidth)
-  int32(micro)
+proc requireTicks(payload: JsonNode, key: string): int =
+  if not payload.hasKey(key):
+    raise newException(ScriptError, "missing required field: " & key)
+  let node = payload[key]
+  if node.kind != JInt:
+    raise newException(ScriptError, "field must be an integer: " & key)
+  let ticks = node.getBiggestInt()
+  if ticks < 0 or ticks > 24:
+    raise newException(ScriptError, "field out of range [0, 24]: " & key)
+  int(ticks)
 
-proc readTicks(node: JsonNode, fallback: int): int =
-  let read = readNumber(node)
-  if not read.ok:
-    return fallback
-  var ticks = int(round(read.value))
-  if ticks < 0: ticks = 0
-  if ticks > 24: ticks = 24
-  ticks
+proc optionalString(payload: JsonNode, key: string): string =
+  if not payload.hasKey(key) or payload[key].kind == JNull:
+    return ""
+  if payload[key].kind != JString:
+    raise newException(ScriptError, "field must be a string: " & key)
+  payload[key].getStr()
 
-proc parsePistonScript*(
-  payload: JsonNode,
-  previous: PistonScript,
-  hadPrevious: bool
-): PistonScript =
-  ## Turns one parsed reply into a legal script, REPAIRING every field the
-  ## schema bounds rather than rejecting the reply. Raises `ScriptError` only
-  ## when NO usable field can be recovered — that is the one condition the
-  ## retry and then the scripted fallback exist for.
+proc parsePistonScript*(payload: JsonNode): PistonScript =
+  ## Strictly parses and validates one piston-program JSON object.
+  ## Raises `ScriptError` on any missing, wrong-type, or out-of-range control
+  ## field; never repairs, clamps, converts units, or invents defaults.
   if payload.isNil or payload.kind != JObject:
     raise newException(ScriptError, "reply is not a JSON object")
-  var usable = 0
-  for key in ["mode", "trigger_m", "lead_ticks", "up_m", "down_m", "idle_m",
-              "speed", "blind"]:
-    if not payload{key}.isNil:
-      inc usable
-  if usable == 0:
-    raise newException(ScriptError, "reply carried no script field")
-  let base = if hadPrevious: previous else: defaultScript()
+  if not payload.hasKey("mode") or payload["mode"].kind != JString:
+    raise newException(ScriptError, "missing or non-string required field: mode")
+  if not payload.hasKey("blind") or payload["blind"].kind != JString:
+    raise newException(ScriptError, "missing or non-string required field: blind")
   result = defaultScript()
-  result.note = sanitizeNote(payload{"note"}.getStr())
-  result.say = sanitizeSay(payload{"say"}.getStr())
-  result.mode = parseMode(payload{"mode"}.getStr(), base.mode)
-  result.blind = parseBlind(payload{"blind"}.getStr(), blindHold)
-  result.triggerUm = readTrigger(payload{"trigger_m"}, DefaultTriggerUm)
-  result.leadTicks = readTicks(payload{"lead_ticks"}, DefaultLeadTicks)
-  result.upUm = readMetres(payload{"up_m"}, DefaultUpUm, Stroke)
-  result.downUm = readMetres(payload{"down_m"}, DefaultDownUm, Stroke)
-  result.idleUm = readMetres(payload{"idle_m"}, DefaultIdleUm, Stroke)
-  result.speed255 = readUnit(payload{"speed"}, DefaultSpeed255)
+  result.mode = parseMode(payload["mode"].getStr())
+  result.blind = parseBlind(payload["blind"].getStr())
+  result.triggerUm = requireMetres(payload, "trigger_m", WindowHalfWidth)
+  result.leadTicks = requireTicks(payload, "lead_ticks")
+  result.upUm = requireMetres(payload, "up_m", Stroke)
+  result.downUm = requireMetres(payload, "down_m", Stroke)
+  result.idleUm = requireMetres(payload, "idle_m", Stroke)
+  result.speed255 = requireUnit(payload, "speed")
+  result.note = sanitizeNote(optionalString(payload, "note"))
+  result.say = sanitizeSay(optionalString(payload, "say"))
   result.source = srcLlm
 
 proc metresText*(micro: int32): string =

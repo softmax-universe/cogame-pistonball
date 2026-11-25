@@ -79,24 +79,18 @@ suite "the decision turn":
     delEnv("ANTHROPIC_API_KEY")
     delEnv("COWORLD_LLM_ENDPOINT")
 
-  test "with no credentials every one of the twenty seats falls back in ONE turn":
+  test "with no credentials the turn fails with policyFailed and installs no substitute script":
     var game = seatedSim(testConfig())
     game.phase = Playing
     var engine = llmEngine(game)
     check engine.batch != nil
-    let records = engine.turn(game, 0, 0)
-    var seatsSeen: seq[int]
-    for record in records:
-      let node = parseJson(record)
-      if node["k"].getStr() == "fallback":
-        check node["cause"].getStr() == "no_credentials"
-        seatsSeen.add(node["seat"].getInt)
-    check seatsSeen.len == 20
+    discard engine.turn(game, 0, 0)
+    check engine.policyFailed
+    check engine.failedSeat == 0
+    check engine.failureCause == "no_credentials"
     for seat in 0 ..< 20:
-      check seat in seatsSeen
-      check engine.haveScript[seat]
-      check engine.scripts[seat].source == srcFallback
-      check validScript(engine.scripts[seat])
+      check not engine.haveScript[seat]
+      check not engine.phaseInstalled[seat]
 
   test "a turn with no credentials costs no wall clock at all":
     var game = seatedSim(testConfig())
@@ -108,7 +102,7 @@ suite "the decision turn":
       discard engine.turn(game, turn, 0)
     check epochTime() - started < 2.0
 
-  test "the budget guard fires and the run finishes on the scripted layer":
+  test "the budget guard fires and fails LLM seats instead of substituting wavebot":
     var game = seatedSim(testConfig())
     game.phase = Playing
     var engine = llmEngine(game)
@@ -120,8 +114,10 @@ suite "the decision turn":
         guarded = true
     check guarded
     check engine.llmOff
+    check engine.policyFailed
+    check engine.failureCause == "budget_guard"
     for seat in 0 ..< 20:
-      check engine.haveScript[seat]
+      check not engine.haveScript[seat]
 
   test "attempt1Ms + retryMs fit inside turnBudgetMs, and none is sub-second":
     let config = defaultGameConfig()
@@ -220,7 +216,7 @@ suite "the decision turn":
       check engine.scripts[seat].source == srcLlm
       check validScript(engine.scripts[seat])
 
-  test "a batch owner returning after its deadline cannot install a model action":
+  test "a batch owner returning after its deadline fails the turn without installing a substitute":
     var game = seatedSim(testConfig())
     game.phase = Playing
     game.config.turnBudgetMs = 300
@@ -230,22 +226,15 @@ suite "the decision turn":
       @[GoodScript], delayMs = 500)
     engine.batch = fakeBatch(provider)
     let started = epochTime()
-    let records = engine.turn(game, 0, 0)
+    discard engine.turn(game, 0, 0)
     let elapsed = epochTime() - started
     check provider.batches.len == 1          # the budget cancelled the retry
     check elapsed < 2.0
-    var timedOutSeats: seq[int]
-    for record in records:
-      let node = parseJson(record)
-      if node["k"].getStr() == "fallback" and
-          node["cause"].getStr() == "timeout":
-        let seat = node["seat"].getInt()
-        if seat notin timedOutSeats: timedOutSeats.add(seat)
-    check timedOutSeats.len == 20
+    check engine.policyFailed
+    check engine.failureCause == "timeout"
     for seat in 0 ..< 20:
-      check engine.haveScript[seat]
-      check engine.scripts[seat].source == srcFallback
-      check validScript(engine.scripts[seat])
+      check not engine.haveScript[seat]
+      check not engine.phaseInstalled[seat]
 
   test "a parse failure retries EXACTLY once, and the retry is one batch too":
     var game = seatedSim(testConfig())
@@ -255,40 +244,28 @@ suite "the decision turn":
       "I am sorry, I cannot help with that.",
       GoodScript])
     engine.batch = fakeBatch(provider)
-    let records = engine.turn(game, 0, 0)
+    discard engine.turn(game, 0, 0)
     check provider.batches.len == 2
     check provider.batches[1].size == 20
+    check not engine.policyFailed
     for seat in 0 ..< 20:
       check engine.scripts[seat].source == srcLlm
-    var attempts: seq[int]
-    for record in records:
-      let node = parseJson(record)
-      if node["k"].getStr() == "fallback":
-        attempts.add(node["attempt"].getInt)
-    for attempt in attempts:
-      check attempt == 1                     # the first try, and no other
 
-  test "a reply that never parses falls back after the SECOND batch, not the third":
+  test "a reply that never parses fails after the SECOND batch without installing a fallback":
     var game = seatedSim(testConfig())
     game.phase = Playing
     var engine = llmEngine(game)
     let provider = newFakeProvider(@["no object here, ever"])
     engine.batch = fakeBatch(provider)
-    let records = engine.turn(game, 0, 0)
+    discard engine.turn(game, 0, 0)
     check provider.batches.len == 2
-    var finals: seq[int]
-    for record in records:
-      let node = parseJson(record)
-      if node["k"].getStr() == "fallback" and node["attempt"].getInt == 2:
-        check node["cause"].getStr() == "parse_error"
-        if node["seat"].getInt notin finals:
-          finals.add(node["seat"].getInt)
-    check finals.len == 20
+    check engine.policyFailed
+    check engine.failureCause == "parse_error"
     for seat in 0 ..< 20:
-      check engine.scripts[seat].source == srcFallback
-      check validScript(engine.scripts[seat])
+      check not engine.haveScript[seat]
+      check not engine.phaseInstalled[seat]
 
-  test "a repaired model proposal keeps ordinary controls but cannot become a model label":
+  test "an out-of-range control field is rejected rather than clamped or substituted":
     var game = seatedSim(testConfig())
     game.phase = Playing
     var engine = llmEngine(game)
@@ -297,30 +274,40 @@ suite "the decision turn":
     let provider = newFakeProvider(@[$proposal])
     engine.batch = fakeBatch(provider)
     discard engine.turn(game, 0, 0)
+    check engine.policyFailed
+    check engine.failureCause == "parse_error"
     for seat in 0 ..< 20:
-      check engine.scripts[seat].upUm == Stroke
-      check engine.scripts[seat].source == srcFallback
+      check not engine.haveScript[seat]
       check engine.phaseSelected[seat].isNone
 
-  test "a THROTTLED provider skips the retry entirely":
+  test "a long spectator note with valid control fields is accepted as a genuine model move":
+    var game = seatedSim(testConfig())
+    game.phase = Playing
+    var engine = llmEngine(game)
+    let proposal = parseJson(GoodScript)
+    proposal["note"] = %repeat("a", 220)
+    let provider = newFakeProvider(@[$proposal])
+    engine.batch = fakeBatch(provider)
+    discard engine.turn(game, 0, 0)
+    check not engine.policyFailed
+    for seat in 0 ..< 20:
+      check engine.haveScript[seat]
+      check engine.scripts[seat].source == srcLlm
+      check engine.scripts[seat].mode == modeWave
+
+  test "a THROTTLED provider skips the retry and fails without installing a fallback":
     var game = seatedSim(testConfig())
     game.phase = Playing
     var engine = llmEngine(game)
     let provider = newFakeProvider(@["{\"message\":\"slow down\"}"], code = 429)
     engine.batch = fakeBatch(provider)
-    let records = engine.turn(game, 0, 0)
-    # One batch, no second: the only candidate model answered 429, so a retry
-    # inside the same turn cannot land and would burn the whole turn budget.
+    discard engine.turn(game, 0, 0)
     check provider.batches.len == 1
-    var throttled = 0
-    for record in records:
-      let node = parseJson(record)
-      if node["k"].getStr() == "fallback" and
-          node["cause"].getStr() == "throttled":
-        inc throttled
-    check throttled >= 20
+    check engine.policyFailed
+    check engine.failureCause == "throttled"
     for seat in 0 ..< 20:
-      check engine.scripts[seat].source == srcFallback
+      check not engine.haveScript[seat]
+      check not engine.phaseInstalled[seat]
 
   test "a seat with a script keeps it; a seat without one plays wavebot":
     var game = seatedSim(testConfig())

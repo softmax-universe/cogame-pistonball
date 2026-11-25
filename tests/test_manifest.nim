@@ -31,11 +31,27 @@ suite "the manifest":
     var declared = initHashSet[string]()
     for entry in manifest["player"]:
       declared.incl(entry["id"].getStr())
+    check "llm" in declared
+    check "baseline" in declared
+    check "metronome" in declared
     var seated = initHashSet[string]()
     for entry in manifest["certification"]["players"]:
       seated.incl(entry["player_id"].getStr())
     for id in declared:
       check id in seated
+
+  test "paid model routes are declared only on the explicit model player":
+    for entry in manifest["player"]:
+      let id = entry["id"].getStr()
+      let env = entry["env"]
+      if id == "llm":
+        check env["COWORLD_LLM_ENABLED"].getStr() == "true"
+        check env["COWORLD_LLM_MODEL"].getStr().len > 0
+        check not env.hasKey("PLAYER_SCRIPTED")
+      else:
+        check not env.hasKey("COWORLD_LLM_ENABLED")
+        check not env.hasKey("COWORLD_LLM_MODEL")
+        check env["PLAYER_SCRIPTED"].getStr().len > 0
 
   test "results_schema keys == playerResultsJson keys, arrays bounded 20/20":
     let game = runScripted(4417231, [blWavebot], maxTicks = 450)
@@ -176,21 +192,29 @@ suite "the manifest":
       check page["content"]["value"].getStr() == readFile(root / file)
 
   test "the certification fleet plays the WHOLE fixture, not a 120-tick sprint":
-    # N5: `certification.players` is 1 baseline + 19 metronomes, not the twenty
-    # baselines design.md:1274-1277 describes, and that is deliberate (844697a):
-    # twenty wavebots deliver in about 120 ticks, the fixture replay came out
-    # 194 ticks / 8 s long, and the viewer smoke's 12 s soak read it as frozen.
-    # The property the fixture actually needs is LENGTH, so pin the length —
-    # otherwise the next physics change quietly re-breaks the smoke.
+    # `certification.players` seats 1 llm + 1 baseline + 18 metronomes:
+    # the 18 metronomes keep the fixture long enough for viewer smoke even if
+    # the llm seat plays a wavebot-like script.
     var kinds: seq[Baseline]
+    var llmSeats = 0
     for entry in manifest["certification"]["players"]:
       var scripted = ""
+      var isLlm = false
       for declared in manifest["player"]:
         if declared["id"].getStr() == entry["player_id"].getStr():
-          scripted = declared["env"]["PLAYER_SCRIPTED"].getStr()
+          if declared["env"].hasKey("PLAYER_SCRIPTED"):
+            scripted = declared["env"]["PLAYER_SCRIPTED"].getStr()
+          if declared["env"].hasKey("COWORLD_LLM_ENABLED") and
+              declared["env"]["COWORLD_LLM_ENABLED"].getStr() == "true":
+            isLlm = true
       checkpoint(entry["player_id"].getStr())
-      check scripted.len > 0
-      kinds.add(parseBaseline(scripted))
+      if isLlm:
+        inc llmSeats
+        kinds.add(blWavebot)
+      else:
+        check scripted.len > 0
+        kinds.add(parseBaseline(scripted))
+    check llmSeats >= 1
     check kinds.len == 20
     let ticks = manifest["certification"]["game_config"]["maxTicks"].getInt
     # The fixture's seed is the sentinel, so certification runs on a random

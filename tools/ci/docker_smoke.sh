@@ -64,8 +64,12 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+mock_llm_pid=""
 
 cleanup() {
+  if [ -n "${mock_llm_pid}" ]; then
+    kill "${mock_llm_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -161,11 +165,16 @@ with open(os.path.join(work, "config.json"), "w") as fh:
 by_id = {p.get("id"): p for p in (manifest.get("player") or [])}
 extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "=" in kv]
 
+has_llm_seat = False
 for slot in range(seats):
     player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
     entry = by_id.get(player_id) or {}
+    entry_env = dict(entry.get("env") or {})
+    is_llm = entry_env.get("COWORLD_LLM_ENABLED") == "true"
+    if is_llm:
+        has_llm_seat = True
     env_args = []
-    for key, value in (entry.get("env") or {}).items():
+    for key, value in entry_env.items():
         env_args += ["-e", f"{key}={value}"]
     for kv in extra_env:
         env_args += ["-e", kv]
@@ -174,7 +183,12 @@ for slot in range(seats):
         fh.write(" ".join(shlex.quote(a) for a in env_args))
     with open(os.path.join(work, f"cmd-{slot}.args"), "w") as fh:
         fh.write(" ".join(shlex.quote(a) for a in argv))
-    print(f"slot {slot}: player_id={player_id or '(default)'} run={argv} env={len(env_args) // 2}")
+    with open(os.path.join(work, f"is-llm-{slot}"), "w") as fh:
+        fh.write("1" if is_llm else "0")
+    print(f"slot {slot}: player_id={player_id or '(default)'} llm={is_llm} run={argv} env={len(env_args) // 2}")
+
+with open(os.path.join(work, "has_llm_seat"), "w") as fh:
+    fh.write("1" if has_llm_seat else "0")
 
 with open(os.path.join(work, "seats"), "w") as fh:
     fh.write(str(seats))
@@ -201,14 +215,69 @@ docker run -d --name "${prefix}-game" \
   -v "${work_dir}:/coworld:rw" \
   "${image}" "${game_bin}" >/dev/null
 
+llm_endpoint="${COWORLD_LLM_ENDPOINT:-}"
+if [ "$(cat "${work_dir}/has_llm_seat")" = "1" ] && [ -z "${llm_endpoint}" ]; then
+  python3 - "${work_dir}/mock_llm_port" "${work_dir}/mock_llm_calls" <<'PY' &
+import http.server, json, socketserver, sys, uuid
+
+port_file, calls_file = sys.argv[1], sys.argv[2]
+action = {
+    "mode": "wave", "trigger_m": 1.0, "lead_ticks": 6,
+    "up_m": 1.45, "down_m": 0.1, "idle_m": 0.25, "speed": 1.0,
+    "blind": "hold", "note": "smoke model action", "say": "smoke"
+}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        with open(calls_file, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"slot": self.headers.get("X-Coworld-Player-Slot"), "model": body.get("model")}) + "\n")
+        payload = json.dumps({
+            "model": body.get("model", "anthropic/claude-haiku-4.5"),
+            "content": [{"type": "text", "text": json.dumps(action)}],
+            "usage": {"input_tokens": 100, "output_tokens": 30},
+            "stop_reason": "end_turn",
+            "sampling_evidence": None,
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid4()))
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self, fmt, *args):
+        pass
+
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+
+with ThreadedTCPServer(("0.0.0.0", 0), Handler) as httpd:
+    with open(port_file, "w", encoding="utf-8") as fh:
+        fh.write(str(httpd.server_address[1]))
+    httpd.serve_forever()
+PY
+  mock_llm_pid="$!"
+  for _ in $(seq 1 50); do
+    [ -s "${work_dir}/mock_llm_port" ] && break
+    sleep 0.1
+  done
+  test -s "${work_dir}/mock_llm_port" || { echo "FAIL: mock LLM server did not bind a port" >&2; exit 1; }
+  llm_endpoint="http://host.docker.internal:$(cat "${work_dir}/mock_llm_port")"
+  echo "started local diagnostic LLM endpoint for smoke: ${llm_endpoint}"
+fi
+
 slot=0
 for ((slot = 0; slot < seats; slot++)); do
   eval "penv=( $(cat "${work_dir}/env-${slot}.args") )"
   eval "pcmd=( $(cat "${work_dir}/cmd-${slot}.args") )"
-  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    penv+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+  extra_docker_args=()
+  if [ "$(cat "${work_dir}/is-llm-${slot}")" = "1" ] && [ -n "${llm_endpoint}" ]; then
+    penv+=(-e "COWORLD_LLM_ENDPOINT=${llm_endpoint}")
+    extra_docker_args+=(--add-host=host.docker.internal:host-gateway)
   fi
   docker run -d --name "${prefix}-p${slot}" --network "${network}" \
+    ${extra_docker_args[@]+"${extra_docker_args[@]}"} \
     -e COWORLD_PLAYER_WS_URL="ws://${prefix}-game:${port}/player?slot=${slot}&token=token-${slot}" \
     ${penv[@]+"${penv[@]}"} \
     "${image}" ${pcmd[@]+"${pcmd[@]}"} >/dev/null
