@@ -47,8 +47,7 @@ type
     {.closure, gcsafe.}
 
   SeatPolicy* = object
-    ## What one seat registered as. A seat that registers with neither field —
-    ## or never registers at all — is `wavebot`.
+    ## What one seat registered as.
     isLlm*: bool
     unavailable*: bool
     baseline*: Baseline
@@ -115,24 +114,25 @@ proc windowView*(
 
 proc scriptFor*(
   engine: DecisionEngine, sim: SimServer, seat: int
-): PistonScript =
-  ## The script the controller runs for one seat: this turn's, else last
-  ## turn's, else `wavebot`'s. NO failure mode leaves a piston uncommanded.
+): Option[PistonScript] =
+  ## The installed script for one seat, or `none` if no script has been
+  ## installed yet. Never substitutes a scripted baseline.
   if seat >= 0 and seat < engine.haveScript.len and engine.haveScript[seat]:
-    return engine.scripts[seat]
-  wavebotScript(engine.windowView(sim, seat,
-    sim.gameTicksElapsed() div sim.config.turnTicks), engine.params)
+    return some(engine.scripts[seat])
+  none(PistonScript)
 
 proc commandFor*(
   engine: DecisionEngine, sim: SimServer, piston: int
 ): uint8 =
   ## The command byte for one PISTON this tick. Called in piston index order
   ## 0 .. 19, never seat order — seat order varies with `perm` and the loop
-  ## must not.
+  ## must not. Returns neutral 127 (zero velocity) if a seat is absent or has
+  ## no installed script; never substitutes a scripted baseline.
   let seat = sim.seatOfPiston(piston)
-  if seat < 0:
-    return pistonCommand(sim, wavebotProgram(engine.params), piston)
-  pistonCommand(sim, engine.scriptFor(sim, seat), piston)
+  let script = engine.scriptFor(sim, seat)
+  if script.isNone:
+    return 127'u8
+  pistonCommand(sim, script.get(), piston)
 
 # ---------------------------------------------------------------------------
 #  Sightings: the seat's own local memory

@@ -193,7 +193,6 @@ scores every episode is a twenty-way draw and Elo cannot separate anybody.
 | fault    | sim_fault   | an invariant guard tripped                   |
 | fault    | host_error  | an unexpected server-side exception          |
 
-A seat that never connects does NOT end the episode: the lobby join budget
-expires, the no-show is reported to COGAME_PLAYER_FAILURE_URI, its piston is
-driven by the wavebot baseline for the whole run, and the run plays to a normal
-ending.
+A seat that never connects or disconnects before completion ends the episode as
+a player failure (`COGAME_PLAYER_FAILURE_URI`), with no substitute baseline and
+no normal results or scores.
