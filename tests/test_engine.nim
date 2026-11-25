@@ -309,18 +309,18 @@ suite "the decision turn":
       check not engine.haveScript[seat]
       check not engine.phaseInstalled[seat]
 
-  test "a seat with a script keeps it; a seat without one plays wavebot":
+  test "a seat with a script keeps it; a seat without one emits neutral hold and never substitutes wavebot":
     var game = seatedSim(testConfig())
     game.phase = Playing
     var engine = initDecisionEngine(game)
     check not engine.haveScript[3]
-    let fallback = engine.scriptFor(game, 3)
-    check fallback.mode == modeWave           # wavebot's shape
+    check engine.scriptFor(game, 3).isNone
+    check engine.commandFor(game, game.pistonOfSeat(3)) == 127'u8
     var mine = defaultScript()
     mine.mode = modeCatch
     engine.scripts[3] = mine
     engine.haveScript[3] = true
-    check engine.scriptFor(game, 3).mode == modeCatch
+    check engine.scriptFor(game, 3).get().mode == modeCatch
 
   test "a scripted seat never produces a fallback record":
     var game = seatedSim(testConfig())

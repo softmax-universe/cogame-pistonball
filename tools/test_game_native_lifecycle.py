@@ -22,7 +22,7 @@ def free_port() -> int:
 async def main() -> None:
     game, player, destination = map(lambda arg: Path(arg).resolve(), sys.argv[1:4])
     scenario = sys.argv[4] if len(sys.argv) == 5 else "complete"
-    assert scenario in ("complete", "large", "TERM", "INT", "invalid_action", "no_endpoint")
+    assert scenario in ("complete", "large", "TERM", "INT", "invalid_action", "no_endpoint", "disconnect")
     destination.mkdir(mode=0o700)
     action = {"mode": "wave", "trigger_m": 0.2, "lead_ticks": 12,
               "up_m": 1.6, "down_m": 0.0, "idle_m": 0.0, "speed": 1.0,
@@ -129,6 +129,9 @@ async def main() -> None:
                     assert frame.type.name == "BINARY" and len(frame.data) > 0
             if scenario in ("complete", "large", "invalid_action"):
                 release.set()
+            elif scenario == "disconnect":
+                processes[2].kill()
+                release.set()
             elif scenario in ("TERM", "INT"):
                 game_process.send_signal(signal.SIGTERM if scenario == "TERM" else signal.SIGINT)
             async with asyncio.timeout(45):
@@ -136,25 +139,38 @@ async def main() -> None:
                     stdout, stderr = await process.communicate()
                     (destination / f"owner-{index}.stdout").write_bytes(stdout)
                     (destination / f"owner-{index}.stderr").write_bytes(stderr)
+                    if scenario == "disconnect" and index == 2:
+                        continue
                     assert process.returncode == 0, (index, process.returncode)
         events = [json.loads(line) for line in private.read_text().splitlines()]
         episode = events[-1]
         expected_status = (
             "completed" if scenario in ("complete", "large")
-            else "failed" if scenario in ("invalid_action", "no_endpoint")
+            else "failed" if scenario in ("invalid_action", "no_endpoint", "disconnect")
             else "truncated"
         )
-        assert episode["status"] == expected_status and episode["outcome"]["all_player_workers_joined"]
+        assert episode["status"] == expected_status
+        if scenario != "disconnect":
+            assert episode["outcome"]["all_player_workers_joined"]
         assert (destination / "results.json").is_file() == (scenario in ("complete", "large"))
         assert (destination / "episode.replay").is_file() == (scenario in ("complete", "large"))
-        if scenario in ("invalid_action", "no_endpoint"):
+        if scenario in ("invalid_action", "no_endpoint", "disconnect"):
             assert (destination / "player_failure.json").is_file()
+            failure_doc = json.loads((destination / "player_failure.json").read_text())
+            assert isinstance(failure_doc.get("failed_policy_index"), int)
+            assert failure_doc["failed_policy_index"] >= 0
+            if scenario == "disconnect":
+                assert failure_doc["failed_policy_index"] == 1
+            assert 1 <= len(failure_doc.get("message", "")) <= 2000
+            assert set(failure_doc.keys()) <= {"failed_policy_index", "message", "kind"}
             assert episode.get("participants") is None
         known = {call["call_id"]: call for call in calls}
         accepted = 0
         for event in events[:-1]:
             for attempt in event["attempts"]:
                 if attempt["origin"] == "model":
+                    if scenario == "disconnect" and event["seat"] == "1":
+                        continue
                     assert attempt["response_reader_joined"]
                     if attempt["platform_call_id"] is None:
                         # STOP may cancel a prepared request before HTTP starts.
@@ -164,8 +180,9 @@ async def main() -> None:
                         assert attempt["response_body_b64"] in (None, "")
                         assert not attempt["accepted"]
                     else:
-                        assert attempt["response_complete"] is (scenario in ("complete", "large", "invalid_action"))
-                        assert attempt["response_body_b64"] == known[attempt["platform_call_id"]]["body_b64"]
+                        if scenario != "disconnect":
+                            assert attempt["response_complete"] is (scenario in ("complete", "large", "invalid_action"))
+                            assert attempt["response_body_b64"] == known[attempt["platform_call_id"]]["body_b64"]
             if scenario == "large" and attempt["origin"] == "model" and event["seat"] == "0":
                     assert attempt["prompt_token_ids"] == list(range(32768))
                     assert attempt["sampled_token_ids"] == [7, 8]
@@ -177,7 +194,7 @@ async def main() -> None:
                 accepted += selected["origin"] == "model"
         if scenario in ("complete", "large"):
             assert accepted == len(events) - 1 and accepted >= 20
-        else:
+        elif scenario != "disconnect":
             assert accepted == 0
         (destination / "proof.json").write_text(json.dumps({"native_calls": len(calls),
             "accepted_decisions": accepted, "owners": len(processes), "status": expected_status,

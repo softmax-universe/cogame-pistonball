@@ -336,11 +336,14 @@ proc websocketHandler(
       echo "player disconnected: ", who
 
 proc declarePlayerFailure(slot: int, message: string, deadline: MonoTime) =
-  ## Publish a real lobby no-show within the original process deadline.
+  ## Publish a terminal player failure within the original process deadline.
   let destination = getEnv("COGAME_PLAYER_FAILURE_URI")
   if destination.len == 0: return
+  let bounded =
+    if message.len == 0: "player failed"
+    else: message.truncateRunes(2000)
   writeCogameArtifact(destination,
-    $(%*{"failed_policy_index": slot, "message": message}),
+    $(%*{"failed_policy_index": max(0, slot), "message": bounded}),
     "application/json", "pistonball player failure", deadline)
 
 proc parseRegistration*(
@@ -651,6 +654,7 @@ proc playerBatch(
         let requestId = $requestNumber & "-seat-" & $call.seat
         var raw = ""
         var receivedAt: MonoTime
+        var socketDisconnected = false
         {.gcsafe.}:
           withLock appState.lock:
             let socket = seatSockets[call.seat]
@@ -660,6 +664,12 @@ proc playerBatch(
               dec appState.queuedEvidenceBytes, frame.body.len
               raw = frame.body
               receivedAt = frame.receivedAt
+            elif socket in appState.disconnected:
+              socketDisconnected = true
+        if socketDisconnected:
+          result[position].cause = "transport_error"
+          result[position].error = "player disconnected"
+          continue
         if raw.len == 0:
           pending = true
           continue
@@ -903,12 +913,15 @@ proc runGameOwnerLoop(
       sim.stopForWallClock()
       quitAfterFrame = true
 
+    var disconnectedSeat = -1
     {.gcsafe.}:
       withLock appState.lock:
         for websocket in appState.closedSockets:
-          # A seat that drops does NOT lose its piston: its script source
-          # degrades to `wavebot` and it revives on reconnect. Deleting the
-          # roster row would renumber every later seat mid-replay.
+          if not replayLoaded and disconnectedSeat < 0 and
+              websocket in appState.playerIndices:
+            let idx = appState.playerIndices[websocket]
+            if idx >= 0 and idx < engine.seats.len:
+              disconnectedSeat = idx
           appState.playerReady.del(websocket)
           appState.playerViewers.del(websocket)
           appState.chatMessages.del(websocket)
@@ -1015,6 +1028,19 @@ proc runGameOwnerLoop(
           appState.globalViewers[websocket].replayCommands.setLen(0)
           appState.globalViewers[websocket].replaySeekTick = -1
 
+    if not replayLoaded and not policyFailed and not quitAfterFrame and
+        sim.phase != GameOver and disconnectedSeat >= 0:
+      let msg = "player slot " & $disconnectedSeat &
+        " disconnected before episode completion"
+      declarePlayerFailure(disconnectedSeat, msg, episodeDeadline)
+      policyFailed = true
+      policyFailureDetails = %*{
+        "type": "PlayerDisconnected",
+        "seat": disconnectedSeat,
+        "message": msg
+      }
+      quitAfterFrame = true
+
     if not replayLoaded and not noShowDeclared and sim.lobbyJoinTimedOut():
       # A seat that never connects ends the episode as a player failure rather
       # than substituting a scripted baseline.
@@ -1039,97 +1065,114 @@ proc runGameOwnerLoop(
       #  Named edit 3: the decision turn, then the control-compiled command
       #  bytes. Only the bytes below are recorded.
       # ------------------------------------------------------------------
-      if sim.phase == Playing:
+      if sim.phase == Playing and not quitAfterFrame and not policyFailed:
         {.gcsafe.}:
           withLock appState.lock: appState.started = true
-        engine.observe(sim)
-        let
-          turnTicks = max(1, config.turnTicks)
-          turnIndex = sim.gameTicksElapsed() div turnTicks
-        # Keyed on the turn INDEX changing, not on `elapsed mod turnTicks == 0`:
-        # the phase flips to Playing INSIDE a step, so the first iteration that
-        # sees Playing already has one elapsed tick and the modulo test would
-        # skip turn 0 entirely — every seat would play the scripted layer for
-        # the first 225 ticks and the LLM would never be asked to open.
-        if turnIndex != lastTurnIndex:
-          if trajectory.isSome:
-            for issued in pendingMacros.mitems: issued.endTick = sim.tickCount
-            completedMacros.add(pendingMacros)
-            pendingMacros.setLen(0)
-          lastTurnIndex = turnIndex
-          var seatSockets = newSeq[WebSocket](engine.seats.len)
-          var seatConnected = newSeq[bool](engine.seats.len)
-          for i, seat in playerIndices:
-            if seat >= 0 and seat < engine.seats.len:
-              seatSockets[seat] = sockets[i]
-              seatConnected[seat] = true
-          proc publishWaiting() {.gcsafe.} =
-            {.cast(gcsafe).}:
-              publishGlobalFrames(sim, replayPlayer, false, liveSpeedIndex, newJArray())
-          engine.batch = playerBatch(seatSockets, seatConnected, publishWaiting, systemPrompt(selection, config))
-          let elapsedSeconds = (getMonoTime() - episodeStart).inSeconds.int
-          let records = engine.turn(sim, turnIndex, elapsedSeconds)
-          if trajectory.isSome:
+        var seatSockets = newSeq[WebSocket](engine.seats.len)
+        var seatConnected = newSeq[bool](engine.seats.len)
+        for i, seat in playerIndices:
+          if seat >= 0 and seat < engine.seats.len:
+            seatSockets[seat] = sockets[i]
+            seatConnected[seat] = true
+        var absentSeat = -1
+        for seat in 0 ..< engine.seats.len:
+          if not seatConnected[seat] or not engine.seats[seat].registered:
+            absentSeat = seat
+            break
+        if absentSeat >= 0:
+          let msg = "player slot " & $absentSeat &
+            " is absent or disconnected during play"
+          declarePlayerFailure(absentSeat, msg, episodeDeadline)
+          policyFailed = true
+          policyFailureDetails = %*{
+            "type": "SeatAbsent",
+            "seat": absentSeat,
+            "message": msg
+          }
+          quitAfterFrame = true
+        else:
+          engine.observe(sim)
+          let
+            turnTicks = max(1, config.turnTicks)
+            turnIndex = sim.gameTicksElapsed() div turnTicks
+          # Keyed on the turn INDEX changing, not on `elapsed mod turnTicks == 0`:
+          # the phase flips to Playing INSIDE a step, so the first iteration that
+          # sees Playing already has one elapsed tick and the modulo test would
+          # skip turn 0 entirely — every seat would play the scripted layer for
+          # the first 225 ticks and the LLM would never be asked to open.
+          if turnIndex != lastTurnIndex:
+            if trajectory.isSome:
+              for issued in pendingMacros.mitems: issued.endTick = sim.tickCount
+              completedMacros.add(pendingMacros)
+              pendingMacros.setLen(0)
+            lastTurnIndex = turnIndex
+            proc publishWaiting() {.gcsafe.} =
+              {.cast(gcsafe).}:
+                publishGlobalFrames(sim, replayPlayer, false, liveSpeedIndex, newJArray())
+            engine.batch = playerBatch(seatSockets, seatConnected, publishWaiting, systemPrompt(selection, config))
+            let elapsedSeconds = (getMonoTime() - episodeStart).inSeconds.int
+            let records = engine.turn(sim, turnIndex, elapsedSeconds)
+            if trajectory.isSome:
+              for seat in 0 ..< engine.seats.len:
+                let installed = engine.phaseInstalled[seat]
+                let action = if installed: appliedScriptAction(engine.scripts[seat]) else: newJNull()
+                let status = if not installed: asMissing
+                  elif engine.scripts[seat].source == srcFallback: asFallback
+                  else: asAccepted
+                pendingMacros.add(StagedMacro(decisionId: $turnIndex & "-" & $seat,
+                  seat: seat, turn: turnIndex, startTick: sim.tickCount,
+                  observation: engine.phaseViews[seat], action: action, status: status,
+                  attempts: engine.phaseAttempts[seat], selected: engine.phaseSelected[seat]))
+            if engine.policyFailed and not interruptionRequested():
+              policyFailed = true
+              let msg = "seat " & $engine.failedSeat & " failed (" &
+                engine.failureCause & "): " & engine.failureDetail
+              declarePlayerFailure(engine.failedSeat, msg, episodeDeadline)
+              policyFailureDetails = %*{
+                "type": "PolicyFailure",
+                "seat": engine.failedSeat,
+                "cause": engine.failureCause,
+                "message": engine.failureDetail
+              }
+              quitAfterFrame = true
+            if interruptionRequested(): quitAfterFrame = true
+            for record in records:
+              replayWriter.writeChat(tickTime(sim.tickCount), 0, record)
             for seat in 0 ..< engine.seats.len:
-              let installed = engine.phaseInstalled[seat]
-              let action = if installed: appliedScriptAction(engine.scripts[seat]) else: newJNull()
-              let status = if not installed: asMissing
-                elif engine.scripts[seat].source == srcFallback: asFallback
-                else: asAccepted
-              pendingMacros.add(StagedMacro(decisionId: $turnIndex & "-" & $seat,
-                seat: seat, turn: turnIndex, startTick: sim.tickCount,
-                observation: engine.phaseViews[seat], action: action, status: status,
-                attempts: engine.phaseAttempts[seat], selected: engine.phaseSelected[seat]))
-          if engine.policyFailed and not interruptionRequested():
-            policyFailed = true
-            let msg = "seat " & $engine.failedSeat & " failed (" &
-              engine.failureCause & "): " & engine.failureDetail
-            declarePlayerFailure(engine.failedSeat, msg, episodeDeadline)
-            policyFailureDetails = %*{
-              "type": "PolicyFailure",
-              "seat": engine.failedSeat,
-              "cause": engine.failureCause,
-              "message": engine.failureDetail
-            }
-            quitAfterFrame = true
-          if interruptionRequested(): quitAfterFrame = true
-          for record in records:
-            replayWriter.writeChat(tickTime(sim.tickCount), 0, record)
-          for seat in 0 ..< engine.seats.len:
-            if not engine.haveScript[seat]:
-              continue
-            let
-              script = engine.scripts[seat]
-              piston = max(0, sim.pistonOfSeat(seat))
-            case script.source
-            of srcLlm: inc sim.llmTurns[min(seat, sim.llmTurns.high)]
-            of srcFallback:
-              inc sim.fallbackTurns[min(seat, sim.fallbackTurns.high)]
-            of srcScripted: discard
-            let record = boundedScriptRecord(
-              script, turnIndex, seat, piston, alias(piston))
-            replayWriter.writeChat(tickTime(sim.tickCount), seat, record)
-            sim.pushFeedScript(record)
-            sim.emitEvent(Script, source = seat, amount = turnIndex,
-              content = script.note)
-            if script.say.len > 0:
-              sim.holdSay(piston, script.say, sim.tickCount + 60)
-          engine.closeTurn()
+              if not engine.haveScript[seat]:
+                continue
+              let
+                script = engine.scripts[seat]
+                piston = max(0, sim.pistonOfSeat(seat))
+              case script.source
+              of srcLlm: inc sim.llmTurns[min(seat, sim.llmTurns.high)]
+              of srcFallback:
+                inc sim.fallbackTurns[min(seat, sim.fallbackTurns.high)]
+              of srcScripted: discard
+              let record = boundedScriptRecord(
+                script, turnIndex, seat, piston, alias(piston))
+              replayWriter.writeChat(tickTime(sim.tickCount), seat, record)
+              sim.pushFeedScript(record)
+              sim.emitEvent(Script, source = seat, amount = turnIndex,
+                content = script.note)
+              if script.say.len > 0:
+                sim.holdSay(piston, script.say, sim.tickCount + 60)
+            engine.closeTurn()
       # Compile ONE command byte per PISTON, in piston index order 0..19,
       # never seat order — seat order varies with `perm` and the loop must
       # not.
-      var commands = newSeq[uint8](sim.seatCount())
-      for i in 0 ..< commands.len:
-        commands[i] = 127'u8
-      for piston in 0 ..< PistonCount:
-        let seat = sim.seatOfPiston(piston)
-        if seat < 0 or seat >= commands.len:
-          continue
-        let command = engine.commandFor(sim, piston)
-        commands[seat] = command
-        replayWriter.writeInputMaskChange(
-          tickTime(sim.tickCount), seat, command)
       if not interruptionRequested() and not quitAfterFrame:
+        var commands = newSeq[uint8](sim.seatCount())
+        for i in 0 ..< commands.len:
+          commands[i] = 127'u8
+        for piston in 0 ..< PistonCount:
+          let seat = sim.seatOfPiston(piston)
+          if seat < 0 or seat >= commands.len:
+            continue
+          let command = engine.commandFor(sim, piston)
+          commands[seat] = command
+          replayWriter.writeInputMaskChange(
+            tickTime(sim.tickCount), seat, command)
         let wasPlaying = sim.phase == Playing
         if trajectory.isSome and wasPlaying:
           if executionStartTick < 0:
