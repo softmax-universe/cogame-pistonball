@@ -29,11 +29,9 @@ suite "the server contract":
     check not parseRegistration("{\"type\":\"shout\",\"text\":\"hi\"}").ok
     check not parseRegistration("").ok
 
-  test "External players register through the general interface":
-    let registration = parseRegistration(
-      "{\"type\":\"register\",\"kind\":\"external\",\"policy\":\"external\"}")
-    check registration.ok
-    check registration.kind == "external"
+  test "Unknown registration kinds are rejected":
+    check not parseRegistration(
+      "{\"type\":\"register\",\"kind\":\"external\",\"policy\":\"external\"}").ok
     check not parseRegistration(
       "{\"type\":\"register\",\"kind\":\"unknown\"}").ok
 

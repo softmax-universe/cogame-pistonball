@@ -173,7 +173,7 @@ jobs:
           python tools/test_runtime_input_lifecycle.py /tmp/pistonball "$proof/runtime-https" https
           python tools/test_game_owner_failure.py /tmp/pistonball-owner-failure "$proof/owner-failure"
           python tools/test_game_start_chronology.py /tmp/pistonball /tmp/pistonball-player "$proof/chronology"
-          for scenario in complete large TERM INT; do
+          for scenario in complete large invalid_action no_endpoint TERM INT; do
             python tools/test_game_native_lifecycle.py /tmp/pistonball /tmp/pistonball-player "$proof/$scenario" "$scenario"
           done
 

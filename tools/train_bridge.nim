@@ -202,8 +202,7 @@ when isMainModule:
         for head in heads():
           doAssert candidate[head["name"].getStr()] in head["choices"]
       let parsed = parsePistonScript(
-        if textMode: candidate else: candidate.hostedScript(),
-        engine.scripts[seat], engine.haveScript[seat])
+        if textMode: candidate else: candidate.hostedScript())
       if not textMode: doAssert action(parsed) == candidate
       let executed = if textMode: parsed.appliedScriptAction() else: action(parsed)
       engine.scripts[seat] = parsed

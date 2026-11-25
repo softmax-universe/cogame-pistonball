@@ -88,8 +88,7 @@ when isMainModule:
           let view = parseJson(views[seat])
           let teacher = wavebotScript(view)
           let completion = appliedScriptAction(teacher)
-          let parsed = parsePistonScript(completion, engine.scripts[seat],
-            engine.haveScript[seat])
+          let parsed = parsePistonScript(completion)
           doAssert scriptJson(parsed) == scriptJson(teacher)
           doAssert parsed.note == teacher.note and parsed.say == teacher.say
           let decisionId = $turn & "-" & $seat

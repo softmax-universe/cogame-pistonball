@@ -1,64 +1,74 @@
-## Tolerant parsing, the repair table, and the RUNE discipline.
+## Strict reply-schema validation and RUNE-safe display sanitization.
 
 import
   std/[json, strutils, unicode, unittest],
   ../src/pistonball/[sim, scripts]
 
-proc parsed(text: string, previous = defaultScript(), had = false): PistonScript =
-  parsePistonScript(extractJsonObject(text), previous, had)
+const ValidJson = """{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":1.45,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle","note":"lift behind","say":"up"}"""
+
+proc parsed(text: string): PistonScript =
+  parsePistonScript(extractJsonObject(text))
 
 suite "the reply schema":
-  test "prose-prefixed and fenced JSON are both recovered":
-    let a = parsed("Sure! Here is my program:\n```json\n" &
-      "{\"mode\":\"lift\",\"up_m\":1.2}\n```\nHope that helps.")
-    check a.mode == modeLift
-    check a.upUm == 1_200_000'i32
+  test "a valid single JSON object and fenced JSON object are accepted":
+    let a = parsed(ValidJson)
+    check a.mode == modeWave
+    check a.triggerUm == 800_000'i32
+    check a.leadTicks == 6
+    check a.upUm == 1_450_000'i32
+    check a.downUm == 100_000'i32
+    check a.idleUm == 250_000'i32
+    check a.speed255 == 255
+    check a.blind == blindIdle
+    check validScript(a)
 
-  test "percentages and centimetres are accepted":
-    let a = parsed("{\"mode\":\"wave\",\"speed\":80,\"trigger_m\":50," &
-      "\"up_m\":145,\"down_m\":15}")
-    check a.speed255 == 204                     # 0.80 * 255
-    check a.triggerUm == 500_000'i32            # 50 % of a metre
-    check a.upUm == 1_450_000'i32               # 145 cm
-    check a.downUm == 150_000'i32               # 15 cm
+    let b = parsed("```json\n" & ValidJson & "\n```")
+    check b.mode == modeWave
+    check b.upUm == 1_450_000'i32
 
-  test "numeric strings are accepted":
-    let a = parsed("{\"mode\":\"wave\",\"lead_ticks\":\"7\",\"up_m\":\"1.30\"}")
-    check a.leadTicks == 7
-    check a.upUm == 1_300_000'i32
+  test "prose around JSON is rejected":
+    expect ScriptError:
+      discard parsed("Sure! Here is my program:\n" & ValidJson & "\nHope that helps.")
 
-  test "an unknown mode keeps LAST turn's mode, else wave":
-    var previous = defaultScript()
-    previous.mode = modeCatch
-    check parsed("{\"mode\":\"zigzag\",\"up_m\":1.0}", previous, true).mode ==
-      modeCatch
-    check parsed("{\"mode\":\"zigzag\",\"up_m\":1.0}").mode == modeWave
+  test "legacy percentages, centimetres, and numeric strings are rejected":
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":50,"lead_ticks":6,"up_m":1.45,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":145,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":1.45,"down_m":0.1,"idle_m":0.25,"speed":80,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":"7","up_m":"1.30","down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
 
-  test "an unknown blind repairs to hold":
-    check parsed("{\"mode\":\"wave\",\"blind\":\"teleport\"}").blind == blindHold
+  test "unknown mode and unknown blind are rejected":
+    expect ScriptError:
+      discard parsed("""{"mode":"zigzag","trigger_m":0.8,"lead_ticks":6,"up_m":1.0,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":1.0,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"teleport"}""")
 
-  test "absent and out-of-range fields take the documented defaults":
-    let a = parsed("{\"mode\":\"wave\"}")
-    check a.triggerUm == DefaultTriggerUm
-    check a.leadTicks == DefaultLeadTicks
-    check a.upUm == DefaultUpUm
-    check a.downUm == DefaultDownUm
-    check a.idleUm == DefaultIdleUm
-    check a.speed255 == DefaultSpeed255
-    let b = parsed("{\"mode\":\"wave\",\"lead_ticks\":900,\"up_m\":-4," &
-      "\"speed\":-1,\"trigger_m\":9.5}")
-    check b.leadTicks == 24
-    check b.upUm == 0'i32
-    check b.speed255 == 0
-    check b.triggerUm == WindowHalfWidth
-    check validScript(b)
+  test "absent and out-of-range control fields are rejected rather than repaired":
+    expect ScriptError:
+      discard parsed("""{"mode":"wave"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":25,"up_m":1.0,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":1.7,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":1.0,"down_m":-0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":1.2,"lead_ticks":6,"up_m":1.0,"down_m":0.1,"idle_m":0.25,"speed":1.0,"blind":"idle"}""")
+    expect ScriptError:
+      discard parsed("""{"mode":"wave","trigger_m":0.8,"lead_ticks":6,"up_m":1.0,"down_m":0.1,"idle_m":0.25,"speed":-0.1,"blind":"idle"}""")
 
-  test "a 300-character note is cut to 160 RUNES":
+  test "a 300-character spectator note is cut to 160 RUNES without rejecting valid controls":
     var long = ""
     for _ in 0 ..< 300:
       long.add("x")
-    let a = parsed("{\"mode\":\"wave\",\"note\":\"" & long & "\"}")
+    let node = parseJson(ValidJson)
+    node["note"] = %long
+    let a = parsePistonScript(node)
     check a.note.runeLen == MaxNoteRunes
+    check a.mode == modeWave
 
   test "a say whose 48th and 49th characters are a 4-byte emoji cuts on the RUNE boundary":
     var say = ""
@@ -66,17 +76,18 @@ suite "the reply schema":
       say.add("a")
     say.add("\xF0\x9F\x9B\xA0")          # U+1F6E0, four bytes
     say.add("\xF0\x9F\x9B\xA0")
-    let a = parsed("{\"mode\":\"wave\",\"say\":" & escapeJson(say) & "}")
+    let node = parseJson(ValidJson)
+    node["say"] = %say
+    let a = parsePistonScript(node)
     check a.say.runeLen <= MaxSayRunes
     check a.say.validateUtf8() == -1     # still valid UTF-8: no half codepoint
-    # And the whole record round-trips through a strict JSON parser.
     let record = boundedScriptRecord(a, 3, 4, 9, alias(9))
     check record.runeLen <= MaxScriptRecordRunes
-    let node = parseJson(record)
-    check node["say"].getStr().runeLen <= MaxSayRunes
-    check node["k"].getStr() == "script"
+    let parsedRecord = parseJson(record)
+    check parsedRecord["say"].getStr().runeLen <= MaxSayRunes
+    check parsedRecord["k"].getStr() == "script"
 
-  test "a reply with no usable field is rejected, which is what the retry is for":
+  test "a reply with no usable object is rejected":
     expect ScriptError:
       discard parsed("{\"note\":\"thinking about it\"}")
     expect ScriptError:
