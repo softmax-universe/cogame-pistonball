@@ -13,16 +13,14 @@ type
   LlmClient* = ref object
     sidecarEndpoint: string
     model*: string
-    maxOutputTokens*: int
     temperature*: Option[float]
     disabled*: bool
     throttled*: bool
     lastAttempt*: DecisionAttempt
     attempts*: seq[DecisionAttempt]
 
-proc newLlmClient*(config: GameConfig): LlmClient =
-  result = LlmClient(model: getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5"),
-    maxOutputTokens: max(1, config.maxOutputTokens))
+proc newLlmClient*(): LlmClient =
+  result = LlmClient(model: getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5"))
   result.sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip().strip(
     chars = {'/'}, leading = false)
   result.disabled = result.sidecarEndpoint.len == 0
@@ -35,7 +33,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
     result.temperature = some(temperature)
 
 proc requestFor*(client: LlmClient, system, user: string,
-    slot: int): tuple[url: string, headers: HttpHeaders, body: string] =
+    slot, maxOutputTokens: int): tuple[url: string, headers: HttpHeaders, body: string] =
   if slot < 0:
     raise newException(LlmError, "native inference requires the issued player slot")
   if client.disabled:
@@ -44,7 +42,7 @@ proc requestFor*(client: LlmClient, system, user: string,
   result.headers["content-type"] = "application/json"
   result.headers["anthropic-version"] = AnthropicVersion
   result.headers["X-Coworld-Player-Slot"] = $slot
-  var body = %*{"model": client.model, "max_tokens": client.maxOutputTokens,
+  var body = %*{"model": client.model, "max_tokens": maxOutputTokens,
     "system": system, "messages": [{"role": "user", "content": user}]}
   if client.temperature.isSome: body["temperature"] = %client.temperature.get()
   result.body = $body
@@ -205,15 +203,15 @@ proc textOf*(client: LlmClient, response: NativeHttpResponse): string =
     raise newException(LlmError, "native reply ended before a JSON action")
 
 proc call*(client: LlmClient, system, user: string, deadline: MonoTime,
-    slot: int, attemptId, policy: string, control: var NativeRequestControl,
+    slot, maxOutputTokens: int, attemptId, policy: string, control: var NativeRequestControl,
     beforeCall: proc(attempt: DecisionAttempt) {.closure, gcsafe.}): string =
-  let request = client.requestFor(system, user, slot)
+  let request = client.requestFor(system, user, slot, maxOutputTokens)
   client.lastAttempt = newDecisionAttempt(attemptId, policy, aoModel)
   client.lastAttempt.prompt = %*[{"role": "system", "content": system},
     {"role": "user", "content": user}]
   client.lastAttempt.request = parseJson(request.body)
   client.lastAttempt.model = some(client.model)
-  client.lastAttempt.decoder = %*{"max_tokens": client.maxOutputTokens}
+  client.lastAttempt.decoder = %*{"max_tokens": maxOutputTokens}
   if client.temperature.isSome:
     client.lastAttempt.decoder["temperature"] = %client.temperature.get()
   var transportStarted = false

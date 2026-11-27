@@ -81,7 +81,7 @@ async def play(binary: Path, destination: Path, scenario: str) -> None:
             registration = await ws.receive()
             assert registration.data[0] == 0x81
             await ws.send_json({"type": "decision", "decision_id": "d0", "attempt_id": "d0-a0",
-                                "view": {"window": {"ball": None}}, "system": "fixture rules", "retry": False,
+                                "view": {"window": {"ball": None}}, "system": "fixture rules", "retry": False, "max_tokens": 731,
                                 "transport": {"budget_ms": 6000, "cleanup_budget_ms": 2000}})
             started = json.loads((await ws.receive()).data)
             assert started["type"] == "attempt_started"

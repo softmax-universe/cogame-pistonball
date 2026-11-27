@@ -35,6 +35,7 @@ async def main() -> None:
 
     async def infer(request: web.Request) -> web.Response:
         body = await request.json()
+        assert body["max_tokens"] == 731
         assert body["temperature"] == 0.4 if scenario == "large" else "temperature" not in body
         call_id = str(uuid.uuid4())
         entered.set()
@@ -70,7 +71,7 @@ async def main() -> None:
     await web.TCPSite(runner, "127.0.0.1", http_port).start()
     config = destination / "config.json"
     config.write_text(json.dumps({"seed": 1, "num_agents": 20, "minPlayers": 20,
-                                 "maxTicks": 60, "turnTicks": 30, "minBatchSpacingMs": 0,
+                                 "maxOutputTokens": 731, "maxTicks": 60, "turnTicks": 30, "minBatchSpacingMs": 0,
                                  "promptVariant": "mixed" if scenario == "complete" else "canonical",
                                  "promptSeed": 3,
                                  "gameOverTicks": 2, "fastMode": True,
