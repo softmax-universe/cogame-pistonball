@@ -606,7 +606,7 @@ proc publishGlobalFrames(sim: var SimServer, replayPlayer: var ReplayPlayer,
 
 proc playerBatch(
   seatSockets: seq[WebSocket], seatConnected: seq[bool],
-  publishWaiting: proc() {.closure, gcsafe.}, system: string
+  publishWaiting: proc() {.closure, gcsafe.}, system: string, maxOutputTokens: int
 ): BatchFn =
   result = proc(calls: seq[BatchCall], deadline: MonoTime): seq[BatchReply]
       {.closure, gcsafe.} =
@@ -636,7 +636,7 @@ proc playerBatch(
       let frame = %*{
         "type": "decision", "decision_id": requestId,
         "attempt_id": requestId & "-native", "seat": call.seat,
-        "view": parseJson(call.view), "system": system,
+        "view": parseJson(call.view), "system": system, "max_tokens": maxOutputTokens,
         "retry": call.retry, "transport": {"budget_ms":
           max(0, int((deadline - getMonoTime()).inMilliseconds)), "cleanup_budget_ms": 5000}}
       if not sendPlayerFrame(seatSockets[call.seat], $frame):
@@ -1110,7 +1110,7 @@ proc runGameOwnerLoop(
             proc publishWaiting() {.gcsafe.} =
               {.cast(gcsafe).}:
                 publishGlobalFrames(sim, replayPlayer, false, liveSpeedIndex, newJArray())
-            engine.batch = playerBatch(seatSockets, seatConnected, publishWaiting, systemPrompt(selection, config))
+            engine.batch = playerBatch(seatSockets, seatConnected, publishWaiting, systemPrompt(selection, config), config.maxOutputTokens)
             let elapsedSeconds = (getMonoTime() - episodeStart).inSeconds.int
             let records = engine.turn(sim, turnIndex, elapsedSeconds)
             if trajectory.isSome:

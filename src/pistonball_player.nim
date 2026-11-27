@@ -2,13 +2,13 @@
 import std/[atomics, json, locks, math, monotimes, options, os, strutils, times]
 import bitworld/[decision_trajectory, native_http, native_stop, native_websocket,
   spriteprotocol]
-import pistonball/[llm, scripts, sim_config, sim_types]
+import pistonball/[llm, scripts, sim_types]
 
 type PlayerCall = object
   socket: ptr NativeWebSocket
   decisionId, attemptId, observation, systemPrompt, operatorPrompt, policy: string
   deadline: MonoTime
-  slot: int
+  slot, maxOutputTokens: int
   retry: bool
 
 var
@@ -69,7 +69,7 @@ proc runDecision(call: PlayerCall, client: LlmClient) {.gcsafe.} =
       user.add("\n\nYour previous reply was unusable. Return only JSON.")
     client.throttled = false
     try:
-      let text = client.call(call.systemPrompt, user, call.deadline, call.slot,
+      let text = client.call(call.systemPrompt, user, call.deadline, call.slot, call.maxOutputTokens,
         call.attemptId, call.policy, control, started)
       reply["action"] = extractJsonObject(text)
       reply["source"] = %"llm"
@@ -85,7 +85,7 @@ proc runDecision(call: PlayerCall, client: LlmClient) {.gcsafe.} =
   discard call.socket[].sendNativeText($reply, call.deadline)
 
 proc runWorker() {.gcsafe.} =
-  let client = newLlmClient(defaultGameConfig())
+  let client = newLlmClient()
   while not interruptionRequested():
     let received = jobs.tryRecv()
     if received.dataAvailable:
@@ -213,7 +213,7 @@ when isMainModule:
           attemptId: attemptId.getStr(), observation: $payload["view"],
           systemPrompt: payload["system"].getStr(), operatorPrompt: prompt,
           policy: policy, retry: payload["retry"].getBool(), slot: slot,
-          deadline: decisionDeadline))
+          maxOutputTokens: payload["max_tokens"].getInt(), deadline: decisionDeadline))
       of "stop":
         let stopId = payload["stop_id"]
         if stopId.kind != JString or stopId.getStr().len == 0 or
